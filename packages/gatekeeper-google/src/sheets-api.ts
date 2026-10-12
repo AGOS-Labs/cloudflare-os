@@ -1,16 +1,38 @@
 import type {
-  SpreadsheetCellValue, SpreadsheetInfo, SpreadsheetRange, SpreadsheetValueMode,
-} from "./sheets-types";
+  SpreadsheetCellValue, SpreadsheetInfo, SpreadsheetRange, SpreadsheetSheetInfo,
+  SpreadsheetValueMode,
+} from "./sheets-read-types";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
 import { readGoogleJson } from "./google-response";
+import {
+  parseRange, validateRange, type EnteredValue, type Rect, type ValidatedRange,
+} from "./sheets-model";
 
 const API_BASE = "https://sheets.googleapis.com/v4/spreadsheets";
 const MAX_RANGES = 20;
 const MAX_TOTAL_CELLS = 50_000;
-const MAX_RANGE_LENGTH = 500;
 // Bound the encoded JSON before decoding and parsing.
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
+
+const SPREADSHEET_FIELDS = "spreadsheetId,properties(title,locale,timeZone)";
+const SHEET_PROPERTIES_FIELDS =
+  "properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount))";
+// Never `editors`: it lists collaborators' email addresses.
+const PROTECTED_RANGE_FIELDS =
+  "protectedRanges(range,unprotectedRanges,requestingUserCanEdit,warningOnly)";
+// Each range's position, which Google leaves out where it is 0, and its cells as entered.
+const ENTERED_FIELDS =
+  "sheets(properties(sheetId),data(startRow,startColumn,rowData(values(userEnteredValue))))";
+
+/** A `GridRange`. Google omits each index that is 0, and an end that is unbounded. */
+type RestGridRange = {
+  sheetId?: number;
+  startRowIndex?: number;
+  endRowIndex?: number;
+  startColumnIndex?: number;
+  endColumnIndex?: number;
+};
 
 type RestSpreadsheet = {
   spreadsheetId: string;
@@ -23,6 +45,12 @@ type RestSpreadsheet = {
       hidden?: boolean;
       gridProperties?: { rowCount?: number; columnCount?: number };
     };
+    protectedRanges?: {
+      range?: RestGridRange;
+      unprotectedRanges?: RestGridRange[];
+      requestingUserCanEdit?: boolean;
+      warningOnly?: boolean;
+    }[];
   }[];
 };
 
@@ -31,60 +59,46 @@ type RestValueRange = {
   values?: unknown[][];
 };
 
-type ValidatedRange = {
-  range: string;
-  /** The sheet the range names, unquoted, if it names one. */
-  sheet?: string;
-  rows: number;
-  columns: number;
-  /** The 1-based row and column of the range's bottom-right cell. */
-  endRow: number;
-  endColumn: number;
+/** A cell's `userEnteredValue`: one of these, or none for a blank cell. */
+type RestExtendedValue = {
+  formulaValue?: unknown;
+  stringValue?: unknown;
+  numberValue?: unknown;
+  boolValue?: unknown;
+  errorValue?: { type?: unknown };
 };
 
-function columnNumber(column: string): number {
-  let result = 0;
-  for (let character of column.toUpperCase()) {
-    result = result * 26 + character.charCodeAt(0) - 64;
-  }
-  return result;
-}
+/** A sheet's cells as `spreadsheets:getByDataFilter` returns them: a block per data filter. */
+type RestGridSheet = {
+  properties?: { sheetId?: number };
+  data?: {
+    startRow?: number;
+    startColumn?: number;
+    rowData?: { values?: { userEnteredValue?: RestExtendedValue }[] }[];
+  }[];
+};
 
-function validateRange(range: string): ValidatedRange {
-  if (typeof range !== "string" || range.length === 0 || range.length > MAX_RANGE_LENGTH) {
-    throw new Error(`A1 ranges must contain between 1 and ${MAX_RANGE_LENGTH} characters.`);
-  }
+/** Cells of one sheet. An end Google leaves unbounded is `Infinity`. */
+export type SheetArea = { sheetId: number; rect: Rect };
 
-  // A quoted sheet title escapes an apostrophe as two apostrophes. Requiring explicit cell
-  // coordinates keeps reads bounded; named, whole-row, and whole-column ranges are rejected.
-  let match = range.match(
-    /^(?:('(?:[^']|'')+'|[^'!]+)!)?\$?([A-Za-z]{1,3})\$?([1-9]\d*)(?::\$?([A-Za-z]{1,3})\$?([1-9]\d*))?$/,
-  );
-  if (!match) {
-    throw new Error(
-      `Invalid or unbounded A1 range "${range}". Use a bounded range such as ` +
-      "`'Sheet name'!A1:F200`.",
-    );
-  }
+/** A protected range: the cells it covers, less those it leaves editable. */
+export type SheetProtection = {
+  area: SheetArea;
+  unprotected: SheetArea[];
+  /** Whether the connected account may edit its cells. */
+  requestingUserCanEdit: boolean;
+  /** Whether it only warns before an edit, rather than refusing one. */
+  warningOnly: boolean;
+};
 
-  let [, sheet, start, startRowText, end = start, endRowText = startRowText] = match;
-  let startColumn = columnNumber(start);
-  let startRow = Number(startRowText);
-  let endColumn = columnNumber(end);
-  let endRow = Number(endRowText);
-  if (endColumn < startColumn || endRow < startRow) {
-    throw new Error(`A1 range "${range}" must run from its top-left cell to its bottom-right cell.`);
-  }
+/** A spreadsheet's metadata, with each sheet's protected ranges. */
+export type SpreadsheetMetadata = SpreadsheetInfo & { protectedRanges: SheetProtection[] };
 
-  let rows = endRow - startRow + 1;
-  let columns = endColumn - startColumn + 1;
-  if (!Number.isSafeInteger(rows) || !Number.isSafeInteger(columns)) {
-    throw new Error(`A1 range "${range}" is too large.`);
+/** A `batchUpdate` Google answered with a 4xx status, so it applied none of the requests. */
+export class SheetsWriteRefused extends Error {
+  constructor(readonly status: number) {
+    super(`Google Sheets refused the update [http=${status}]`);
   }
-  return {
-    range, rows, columns, endRow, endColumn,
-    ...(sheet && { sheet: sheet.startsWith("'") ? sheet.slice(1, -1).replaceAll("''", "'") : sheet }),
-  };
 }
 
 function validateRanges(ranges: string[]): ValidatedRange[] {
@@ -116,7 +130,9 @@ function normalizeCell(value: unknown): SpreadsheetCellValue {
   throw new Error("Google Sheets returned an unsupported cell value.");
 }
 
-function normalizeRange(rest: RestValueRange, requested: ValidatedRange): SpreadsheetRange {
+function normalizeRange(
+  rest: RestValueRange, requested: { range: string; rows: number; columns: number },
+): SpreadsheetRange {
   let source = Array.isArray(rest.values) ? rest.values : [];
   let values = Array.from({ length: requested.rows }, (_row, rowIndex) => {
     let row = Array.isArray(source[rowIndex]) ? source[rowIndex] : [];
@@ -128,6 +144,54 @@ function normalizeRange(rest: RestValueRange, requested: ValidatedRange): Spread
   return { range: rest.range ?? requested.range, values };
 }
 
+function spreadsheetInfo(result: RestSpreadsheet): SpreadsheetInfo {
+  return {
+    id: result.spreadsheetId,
+    title: result.properties?.title ?? "Untitled spreadsheet",
+    ...(result.properties?.locale ? { locale: result.properties.locale } : {}),
+    ...(result.properties?.timeZone ? { timeZone: result.properties.timeZone } : {}),
+    sheets: (result.sheets ?? []).flatMap((sheet): SpreadsheetSheetInfo[] => {
+      let properties = sheet.properties;
+      if (properties?.sheetId === undefined || properties.title === undefined) return [];
+      return [{
+        id: properties.sheetId,
+        title: properties.title,
+        index: properties.index ?? 0,
+        rowCount: properties.gridProperties?.rowCount ?? 0,
+        columnCount: properties.gridProperties?.columnCount ?? 0,
+        ...(properties.hidden ? { hidden: true } : {}),
+      }];
+    }).toSorted((a, b) => a.index - b.index),
+  };
+}
+
+// A range with no bounds covers the whole sheet it is listed under.
+function areaOf(range: RestGridRange | undefined, sheetId: number): SheetArea {
+  return {
+    sheetId: range?.sheetId ?? sheetId,
+    rect: {
+      startRow: range?.startRowIndex ?? 0,
+      endRow: range?.endRowIndex ?? Infinity,
+      startColumn: range?.startColumnIndex ?? 0,
+      endColumn: range?.endColumnIndex ?? Infinity,
+    },
+  };
+}
+
+// What a cell holds, from its `userEnteredValue`. A kind of value not known here is refused, so
+// the guard cannot mistake it for another.
+function enteredValue(value: RestExtendedValue | undefined): EnteredValue {
+  if (value === undefined) return null;
+  let { formulaValue, stringValue, numberValue, boolValue, errorValue } = value;
+  if (typeof formulaValue === "string") return { formula: formulaValue };
+  if (typeof stringValue === "string") return stringValue;
+  if (typeof numberValue === "number") return numberValue;
+  if (typeof boolValue === "boolean") return boolValue;
+  if (typeof errorValue?.type === "string") return { error: errorValue.type };
+  throw new Error("Google Sheets returned an unsupported cell value.");
+}
+
+/** The Google Sheets API, as far as the gatekeeper uses it. */
 /** The one sheet a created spreadsheet gets, named here so it doesn't depend on the account's locale. */
 const BLANK_SHEET = { sheetId: 0, title: "Sheet1", rowCount: 1000, columnCount: 26 } as const;
 
@@ -164,30 +228,27 @@ export class GoogleSheetsApi {
 
   async getSpreadsheet(spreadsheetId: string): Promise<SpreadsheetInfo> {
     let url = new URL(`${API_BASE}/${encodeURIComponent(spreadsheetId)}`);
+    url.searchParams.set("fields", `${SPREADSHEET_FIELDS},sheets(${SHEET_PROPERTIES_FIELDS})`);
+    return spreadsheetInfo(await this.#request<RestSpreadsheet>(url, "get spreadsheet"));
+  }
+
+  /** A spreadsheet's metadata and the ranges it protects, but not who may edit them. */
+  async getMetadata(spreadsheetId: string): Promise<SpreadsheetMetadata> {
+    let url = new URL(`${API_BASE}/${encodeURIComponent(spreadsheetId)}`);
     url.searchParams.set(
-      "fields",
-      "spreadsheetId,properties(title,locale,timeZone)," +
-      "sheets(properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)))",
-    );
-    let result = await this.#request<RestSpreadsheet>(url, "get spreadsheet");
-    return {
-      id: result.spreadsheetId,
-      title: result.properties?.title ?? "Untitled spreadsheet",
-      ...(result.properties?.locale ? { locale: result.properties.locale } : {}),
-      ...(result.properties?.timeZone ? { timeZone: result.properties.timeZone } : {}),
-      sheets: (result.sheets ?? []).flatMap(sheet => {
-        let properties = sheet.properties;
-        if (properties?.sheetId === undefined || properties.title === undefined) return [];
-        return [{
-          id: properties.sheetId,
-          title: properties.title,
-          index: properties.index ?? 0,
-          rowCount: properties.gridProperties?.rowCount ?? 0,
-          columnCount: properties.gridProperties?.columnCount ?? 0,
-          ...(properties.hidden ? { hidden: true } : {}),
-        }];
-      }).toSorted((a, b) => a.index - b.index),
-    };
+      "fields", `${SPREADSHEET_FIELDS},sheets(${SHEET_PROPERTIES_FIELDS},${PROTECTED_RANGE_FIELDS})`);
+    let result = await this.#request<RestSpreadsheet>(url, "get spreadsheet metadata");
+    let protectedRanges = (result.sheets ?? []).flatMap(sheet => {
+      let sheetId = sheet.properties?.sheetId;
+      if (sheetId === undefined) return [];
+      return (sheet.protectedRanges ?? []).map(protection => ({
+        area: areaOf(protection.range, sheetId),
+        unprotected: (protection.unprotectedRanges ?? []).map(range => areaOf(range, sheetId)),
+        requestingUserCanEdit: protection.requestingUserCanEdit === true,
+        warningOnly: protection.warningOnly === true,
+      }));
+    });
+    return { ...spreadsheetInfo(result), protectedRanges };
   }
 
   async readRanges(
@@ -209,9 +270,117 @@ export class GoogleSheetsApi {
     let returned = result.valueRanges ?? [];
     return validated.map((range, index) => normalizeRange(returned[index] ?? {}, range));
   }
+
+  /**
+   * The cells of each of `areas` as entered, padded to its size with null. Each must lie within
+   * its sheet's grid. They are read typed, as formula-mode values cannot tell text starting with
+   * `=` from a formula, by grid range with `spreadsheets:getByDataFilter`, which needs a grant that
+   * may edit the spreadsheet. Only the response size bounds the read, so callers bound how many
+   * cells they ask for.
+   */
+  async readEntered(
+    spreadsheetId: string, areas: readonly SheetArea[],
+  ): Promise<EnteredValue[][][]> {
+    if (areas.length === 0) return [];
+    let url = new URL(`${API_BASE}/${encodeURIComponent(spreadsheetId)}:getByDataFilter`);
+    url.searchParams.set("fields", ENTERED_FIELDS);
+    url.searchParams.set("prettyPrint", "false");
+    let response = await fetchWithAuthRetry(
+      url.toString(),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dataFilters: areas.map(({ sheetId, rect }) => ({
+            gridRange: {
+              sheetId,
+              startRowIndex: rect.startRow,
+              endRowIndex: rect.endRow,
+              startColumnIndex: rect.startColumn,
+              endColumnIndex: rect.endColumn,
+            },
+          })),
+          includeGridData: true,
+        }),
+      },
+      // A read, however it is sent.
+      this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS, idempotent: true },
+    );
+    let result = await readGoogleJson<{ sheets?: RestGridSheet[] }>(response, {
+      provider: "Google Sheets", operation: "read entered values", maxBytes: MAX_RESPONSE_BYTES,
+    });
+    // Each range's cells are placed by the position Google gives them, whichever order they come
+    // in, so a range is answered when its sheet holds data starting where it does. A cell Google
+    // trims from the end of a row or range is blank.
+    let starts = new Set<string>();
+    let cells = new Map<string, EnteredValue>();
+    for (let sheet of result.sheets ?? []) {
+      let sheetId = sheet.properties?.sheetId ?? 0;
+      for (let { startRow = 0, startColumn = 0, rowData } of sheet.data ?? []) {
+        starts.add(`${sheetId}:${startRow}:${startColumn}`);
+        rowData?.forEach((row, r) => row.values?.forEach((cell, c) => {
+          cells.set(`${sheetId}:${startRow + r}:${startColumn + c}`, enteredValue(cell.userEnteredValue));
+        }));
+      }
+    }
+    return areas.map(({ sheetId, rect }) => {
+      if (!starts.has(`${sheetId}:${rect.startRow}:${rect.startColumn}`)) {
+        throw new Error("Google Sheets did not return every range it was asked for.");
+      }
+      return Array.from({ length: rect.endRow - rect.startRow }, (_row, r) =>
+        Array.from({ length: rect.endColumn - rect.startColumn }, (_cell, c) =>
+          cells.get(`${sheetId}:${rect.startRow + r}:${rect.startColumn + c}`) ?? null));
+    });
+  }
+
+  /** A developer metadata entry's value, or undefined if the spreadsheet has none with that ID. */
+  async getDeveloperMetadata(
+    spreadsheetId: string, metadataId: number,
+  ): Promise<{ metadataValue?: string } | undefined> {
+    let url = new URL(
+      `${API_BASE}/${encodeURIComponent(spreadsheetId)}/developerMetadata/${metadataId}`);
+    url.searchParams.set("fields", "metadataValue");
+    let response = await fetchWithAuthRetry(
+      url.toString(), {}, this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS },
+    );
+    if (response.status === 404) {
+      await response.body?.cancel();
+      return undefined;
+    }
+    return readGoogleJson<{ metadataValue?: string }>(response, {
+      provider: "Google Sheets", operation: "get developer metadata", maxBytes: MAX_RESPONSE_BYTES,
+    });
+  }
+
+  /**
+   * Apply `requests` together. Throws `SheetsWriteRefused` for a 4xx answer, which applied
+   * nothing; any other failure leaves the outcome unknown, since the update may have been
+   * committed before the response was lost.
+   */
+  async batchUpdate(spreadsheetId: string, requests: unknown[]): Promise<void> {
+    let response = await fetchWithAuthRetry(
+      `${API_BASE}/${encodeURIComponent(spreadsheetId)}:batchUpdate`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requests }),
+      },
+      this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS },
+    );
+    if (response.ok) {
+      await response.body?.cancel();
+      return;
+    }
+    // Always rejects, having logged Google's diagnostics.
+    let failure = await readGoogleJson(response, {
+      provider: "Google Sheets", operation: "batch update", maxBytes: MAX_RESPONSE_BYTES,
+    }).catch((error: unknown) => error);
+    let refused = response.status >= 400 && response.status < 500;
+    throw refused ? new SheetsWriteRefused(response.status) : failure;
+  }
 }
 
-/** The reads a spreadsheet session makes. */
+/** The reads a spreadsheet session makes with no change queued. */
 export type SpreadsheetReader = Pick<GoogleSheetsApi, "getSpreadsheet" | "readRanges">;
 
 /**
@@ -234,12 +403,13 @@ export class BlankSpreadsheet implements SpreadsheetReader {
   async readRanges(_spreadsheetId: string, ranges: string[]): Promise<SpreadsheetRange[]> {
     let { title, rowCount, columnCount } = BLANK_SHEET;
     return validateRanges(ranges).map(range => {
+      let { sheet, rect } = parseRange(range.range);
       // Google matches sheet names case-insensitively, as it keeps them unique.
-      if (range.sheet !== undefined && range.sheet.toLowerCase() !== title.toLowerCase()) {
+      if (sheet !== undefined && sheet.toLowerCase() !== title.toLowerCase()) {
         throw new Error(
-          `No sheet named "${range.sheet}": a spreadsheet awaiting creation has only "${title}".`);
+          `No sheet named "${sheet}": a spreadsheet awaiting creation has only "${title}".`);
       }
-      if (range.endRow > rowCount || range.endColumn > columnCount) {
+      if (rect.endRow > rowCount || rect.endColumn > columnCount) {
         throw new Error(`A1 range "${range.range}" exceeds the ${rowCount} rows and ${columnCount} ` +
           `columns of "${title}".`);
       }
