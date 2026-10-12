@@ -239,6 +239,14 @@ Google's reply and that record being written, or a creation rejected after an ap
 success was lost. Every created file's ID is logged (`google.creation.file.created`), so an orphan
 can be found.
 
+## Google Docs request costs
+
+A read costs one full `documents.get`, replayed for 10 seconds and then revalidated by a
+revision-only `get`. Queuing an edit costs nothing more. Applying one costs a full `get` (the
+edit is materialized against the current revision), the `batchUpdate` carrying the edit and its
+write marker, and a second `batchUpdate` removing the marker; the document is reread after it only
+when more edits are queued behind it, since they must be replayed over the new revision.
+
 ## Known limitations
 
 Very large Google Docs can exceed Durable Objects' 2 MB value limit after Markdown conversion,
