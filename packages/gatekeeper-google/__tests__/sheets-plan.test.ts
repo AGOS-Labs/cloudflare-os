@@ -150,6 +150,35 @@ describe("Sheets change requests", () => {
     expect(() => planSheet(grid([SHEETS[1]]), planned))
       .toThrow("change 1 (clearRange): the spreadsheet has no sheet with ID 0");
   });
+
+  it("formats a range with a repeatCell and then an updateBorders, its sheet as the batch leaves it", () => {
+    let format = { bold: true, fontSize: null, borders: { top: { style: "SOLID", color: "#ff0000" } } } as const;
+    let { planned, requests } = plan([
+      { op: "renameSheet", sheet: "Sales", title: "Sales 2026" },
+      { op: "insertRows", sheet: "Sales 2026", at: 21, count: 5 },
+      { op: "formatCells", range: "'sales 2026'!B24:C25", format },
+    ]);
+    expect(planned[2]).toEqual({ op: "formatCells", sheetId: 0, rect: rect(23, 1, 2, 2), format });
+    let range = { sheetId: 0, startRowIndex: 23, endRowIndex: 25, startColumnIndex: 1, endColumnIndex: 3 };
+    expect(requests.slice(2)).toEqual([
+      {
+        repeatCell: {
+          range,
+          cell: { userEnteredFormat: { textFormat: { bold: true } } },
+          fields: "userEnteredFormat(textFormat(bold,fontSize))",
+        },
+      },
+      { updateBorders: { range, top: { style: "SOLID", colorStyle: { rgbColor: { red: 1, green: 0, blue: 0 } } } } },
+    ]);
+  });
+
+  it("refuses formatting a sheet the spreadsheet has no tab for, or cells outside its grid", () => {
+    expect(refused([{ op: "formatCells", range: "Nope!A1", format: { bold: true } }]))
+      .toThrow('Change 1 (formatCells): the spreadsheet has no sheet named "Nope". Call getSpreadsheet() for sheet titles.');
+    expect(refused([{ op: "formatCells", range: "Sales!A20:A21", format: { bold: true } }]))
+      .toThrow('Change 1 (formatCells): "Sales" has 20 rows and 6 columns, so A21 is outside it. ' +
+        "insertRows with at: 21 adds rows.");
+  });
 });
 
 describe("Sheets structural change requests", () => {
@@ -507,6 +536,8 @@ describe("Sheets guarded cells", () => {
       { op: "renameSheet", sheet: "It's", title: "Other" },
       { op: "insertRows", sheet: "Other", at: 1 },
     ])).toEqual([]);
+    // Formatting is not guarded.
+    expect(cellsOf([{ op: "formatCells", range: "Sales!A1:B2", format: { bold: true } }])).toEqual([]);
   });
 
   it("lists cells once, and refuses more than 50,000", () => {
@@ -555,6 +586,9 @@ describe("Sheets batches built on queued changes", () => {
     expect(after([{ op: "clearRange", range: "'It''s'!Z99" }])).toEqual([2]);
     expect(after([{ op: "renameSheet", sheet: "It's", title: "Other" }])).toEqual([2]);
     expect(after([{ op: "addSheet", title: "Q4" }])).toEqual([]);
+    // Formatting builds on structure, but not on the values it formats, which it does not guard.
+    expect(after([{ op: "formatCells", range: "'It''s'!A1", format: { italic: true } }])).toEqual([2]);
+    expect(after([{ op: "formatCells", range: "Sales!A1:B5", format: { italic: true } }])).toEqual([]);
   });
 
   it("builds a batch with a formula on every structural change queued before it, on any sheet", () => {
@@ -704,8 +738,8 @@ describe("Sheets copies of queued cells", () => {
     let simulated = replayed(grid(big), [filled(1, 0, rect(0, 0, 800, 25))]);
     expect(simulated.cells.size).toBe(20_000);
     expect(() => copies(simulated, 50)).toThrow(
-      'Change 5 (duplicateSheet): copying "Sales" adds its 20,000 queued cells to the copy, which would bring ' +
-      "the cells queued changes enter to 120,000, and at most 100,000 may be queued. Approve or reject queued " +
+      'Change 5 (duplicateSheet): copying "Sales" adds its 20,000 queued cell values and formats to the copy, which would bring ' +
+      "the cell values and formats queued changes set to 120,000, and at most 100,000 may be queued. Approve or reject queued " +
       "changes first.");
     expect(copies(simulated, 4)).toHaveLength(4);
   });
@@ -722,7 +756,7 @@ describe("Sheets copies of queued cells", () => {
     expect(result).toMatchObject({
       kind: "incomplete",
       unsupported: copied,
-      reason: "change 5 (duplicateSheet): it would bring the cells queued changes enter to 120,000, more than " +
+      reason: "change 5 (duplicateSheet): it would bring the cell values and formats queued changes set to 120,000, more than " +
         "the 100,000 that may be queued",
     });
     if (result.kind === "incomplete") expect(result.partial.cells.size).toBe(20_000);
@@ -738,8 +772,46 @@ describe("Sheets copies of queued cells", () => {
       `Change 21 (insertRows): ${MAX_QUEUED_STEPS} changes to rows, columns and sheets are queued already, the most ` +
       "that may be. Approve or reject queued changes first.");
     expect(resolving([{ op: "renameSheet", sheet: "It's", title: "Its" }, ...inserts(20)])).toThrow("Change 21 (insertRows)");
-    // Cells may still be written.
+    // Cells may still be written, and formatted.
     expect(resolving([...inserts(20), { op: "writeCells", range: "Sales!A1", values: [[1]] }])).not.toThrow();
+    expect(resolving([...inserts(20), { op: "formatCells", range: "Sales!A1", format: { bold: true } }])).not.toThrow();
+  });
+
+  it("counts the cells beside a range whose facing border formatting clears toward 100,000", () => {
+    let tall = [sheet(0, "Sales", { rowCount: 20_000, columnCount: 10 })];
+    // Left and right borders on a column format it and clear the borders facing it on both sides.
+    let framed = (id: number, column: number, startRow: number): QueuedChange => queued(id, [{
+      op: "formatCells", sheetId: 0, rect: rect(startRow, column, 10_000, 1),
+      format: { borders: { left: { style: "SOLID" }, right: { style: "SOLID" } } },
+    }]);
+    let simulated = replayed(grid(tall), [framed(1, 1, 0), framed(2, 4, 0), framed(3, 7, 0)]);
+    expect(simulated.formats.size).toBe(90_000);
+    expect(() => resolveChanges(simulated, prepareChanges([{
+      op: "formatCells", range: "Sales!B10001:B20000",
+      format: { borders: { left: { style: "SOLID" }, right: { style: "SOLID" } } },
+    }]), minter())).toThrow(
+      "Change 1 (formatCells): it would bring the cell values and formats queued changes set to 120,000");
+    expect(() => planSheet(simulated, framed(4, 1, 10_000).action.payload.changes))
+      .toThrow("it would bring the cell values and formats queued changes set to 120,000");
+    // Without borders it formats only its own cells.
+    expect(() => resolveChanges(simulated, prepareChanges([
+      { op: "formatCells", range: "Sales!B10001:B20000", format: { bold: true } },
+    ]), minter())).not.toThrow();
+  });
+
+  it("builds a copy on every formatting change queued before it", () => {
+    let pending = [
+      queued(1, [{ op: "formatCells", sheetId: 0, rect: rect(0, 0), format: { bold: true } }]),
+      queued(2, [{ op: "formatCells", sheetId: 7, rect: rect(0, 0), format: { italic: true } }]),
+    ];
+    let simulated = replayed(grid(SHEETS), pending);
+    let copy = resolveChanges(simulated, prepareChanges([{ op: "duplicateSheet", sheet: "Sales" }]), minter(101));
+    expect(guardAfter(simulated, pending, copy, guardCells(simulated, copy))).toEqual([1, 2]);
+    // A write depends on neither.
+    let write = resolveChanges(simulated, prepareChanges([
+      { op: "writeCells", range: "Sales!A1", values: [[1]] },
+    ]), minter());
+    expect(guardAfter(simulated, pending, write, guardCells(simulated, write))).toEqual([]);
   });
 
   it("counts every cell a write or clear enters toward 100,000, but not one already entered", () => {
@@ -748,15 +820,18 @@ describe("Sheets copies of queued cells", () => {
     expect(simulated.cells.size).toBe(100_000);
     let resolving = (changes: SheetChange[]) => () => resolveChanges(simulated, prepareChanges(changes), minter(101));
     expect(resolving([{ op: "writeCells", range: "'It''s'!A1", values: [[1]] }])).toThrow(
-      "Change 1 (writeCells): it would bring the cells queued changes enter to 100,001, and at most 100,000 " +
+      "Change 1 (writeCells): it would bring the cell values and formats queued changes set to 100,001, and at most 100,000 " +
       "may be queued. Approve or reject queued changes first.");
     expect(resolving([{ op: "clearRange", range: "'It''s'!A1:B2" }])).toThrow(
-      "Change 1 (clearRange): it would bring the cells queued changes enter to 100,004");
+      "Change 1 (clearRange): it would bring the cell values and formats queued changes set to 100,004");
     expect(resolving([{ op: "writeCells", range: "Sales!A1:B2", values: [[1, 2], [3, 4]] }])).not.toThrow();
     // A copy of a sheet with nothing queued adds nothing.
     expect(resolving([{ op: "duplicateSheet", sheet: "It's" }])).not.toThrow();
+    // Formatting a cell counts as well, even one whose value is queued.
+    expect(resolving([{ op: "formatCells", range: "Sales!A1", format: { bold: true } }])).toThrow(
+      "Change 1 (formatCells): it would bring the cell values and formats queued changes set to 100,001");
     expect(() => planSheet(simulated, [{ op: "clearRange", sheetId: 7, rect: rect(0, 0) }]))
-      .toThrow(new ChangeConflict("change 1 (clearRange): it would bring the cells queued changes enter to " +
+      .toThrow(new ChangeConflict("change 1 (clearRange): it would bring the cell values and formats queued changes set to " +
         "100,001, more than the 100,000 that may be queued"));
   });
 
@@ -781,7 +856,8 @@ describe("Sheets copies of queued cells", () => {
         { op: "deleteRows", sheetId: 7, start: 0, count: 5 },
         { op: "deleteSheet", sheetId: 101, rowCount: 1000, columnCount: 26 },
       ]);
-      expect(keys).toHaveBeenCalledTimes(1);
+      // Once for the entered values and once for the formats.
+      expect(keys).toHaveBeenCalledTimes(2);
     } finally {
       keys.mockRestore();
     }
@@ -831,6 +907,12 @@ describe("Sheets protected ranges", () => {
       .toThrow("Change 1 (clearRange): B1 is in the protected range Sales!A1:B2, which the connected account may not edit.");
     expect(check([{ op: "clearRange", range: "Sales!B2:C3" }])).not.toThrow();
     expect(check([{ op: "clearRange", range: "'It''s'!A1:Z9" }])).not.toThrow();
+  });
+
+  it("refuses formatting a cell the account may not edit, as it refuses writing one", () => {
+    expect(check([{ op: "formatCells", range: "Sales!A2", format: { bold: true } }]))
+      .toThrow("Change 1 (formatCells): A2 is in the protected range Sales!A1:B2, which the connected account may not edit.");
+    expect(check([{ op: "formatCells", range: "Sales!B2:F20", format: { bold: true } }])).not.toThrow();
   });
 
   it("checks the cells Google holds, so cells of rows queued changes insert are not protected", () => {
