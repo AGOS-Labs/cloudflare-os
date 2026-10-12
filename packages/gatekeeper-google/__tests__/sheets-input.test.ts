@@ -5,6 +5,9 @@ import { rect } from "./sheets-fixture";
 
 const write = (range: string, values: unknown[][]) => ({ op: "writeCells", range, values }) as SheetChange;
 
+/** The refusal of the title of the first change, an `op`. */
+const badTitle = (op: string) => `Change 1 (${op}): title must be a string of 1 to 100 characters.`;
+
 function refusal(changes: SheetChange[]): string {
   try {
     prepareChanges(changes);
@@ -40,8 +43,14 @@ describe("Sheets change input", () => {
     expect(refusal([])).toBe("Make between 1 and 50 changes at a time.");
     expect(refusal(Array.from({ length: 51 }, () => ({ op: "clearRange", range: "Sales!A1" }))))
       .toBe("Make between 1 and 50 changes at a time.");
-    expect(refusal([{ op: "insertRows", range: "Sales!A1" } as unknown as SheetChange]))
-      .toBe("Change 1 (insertRows): op must be writeCells or clearRange.");
+    expect(refusal([{ op: "mergeCells", range: "Sales!A1" } as unknown as SheetChange]))
+      .toBe("Change 1 (mergeCells): op must be one of writeCells, clearRange, addSheet, renameSheet, " +
+        "duplicateSheet, deleteSheet, insertRows, deleteRows, insertColumns or deleteColumns.");
+    // Changes of every kind count toward the 50.
+    let mixed: SheetChange[] = Array.from({ length: 51 }, (_, i) =>
+      i % 2 === 0 ? { op: "insertRows", sheet: "Sales", at: 1 } : { op: "clearRange", range: "Sales!A1" });
+    expect(refusal(mixed)).toBe("Make between 1 and 50 changes at a time.");
+    expect(prepareChanges(mixed.slice(0, 50))).toHaveLength(50);
   });
 
   it("refuses a range that does not name its sheet, or is unbounded or invalid", () => {
@@ -98,5 +107,86 @@ describe("Sheets change input", () => {
     }
     // Text that is not a formula is never a call.
     expect(prepareChanges([write("Sales!A1", [['IMAGE("https://example.com")']])])).toHaveLength(1);
+  });
+});
+
+describe("Sheets structural change input", () => {
+  it("prepares each op with only what it declares, rows and columns zero-based", () => {
+    expect(prepareChanges([
+      { op: "addSheet", title: "Q4", ref: "q4", index: 2, rowCount: 10, columnCount: 3, sheet: "Sales" } as SheetChange,
+      { op: "renameSheet", sheet: "Q4", title: "Q4 2026", range: "Sales!A1" } as SheetChange,
+      { op: "duplicateSheet", sheet: "Sales", ref: "copy" } as SheetChange,
+      { op: "deleteSheet", sheet: "Copy of Sales", sheetId: 9, title: "x" } as SheetChange,
+      { op: "insertRows", sheet: "Sales", at: 5, count: 2 },
+      { op: "deleteRows", sheet: "Q4 2026", at: 1 },
+      { op: "insertColumns", sheet: "Costs", at: "c" },
+      { op: "deleteColumns", sheet: "Costs", at: "AA", count: 4 },
+    ])).toEqual([
+      { op: "addSheet", title: "Q4", index: 2, rowCount: 10, columnCount: 3 },
+      { op: "renameSheet", sheet: "Q4", title: "Q4 2026" },
+      { op: "duplicateSheet", sheet: "Sales" },
+      { op: "deleteSheet", sheet: "Copy of Sales" },
+      { op: "insertRows", sheet: "Sales", start: 4, count: 2 },
+      { op: "deleteRows", sheet: "Q4 2026", start: 0, count: 1 },
+      { op: "insertColumns", sheet: "Costs", start: 2, count: 1 },
+      { op: "deleteColumns", sheet: "Costs", start: 26, count: 4 },
+    ]);
+  });
+
+  it("refuses a title that is empty or over 100 characters", () => {
+    expect(refusal([{ op: "addSheet", title: "" }])).toBe(badTitle("addSheet"));
+    expect(refusal([{ op: "addSheet", title: "x".repeat(101) }])).toBe(badTitle("addSheet"));
+    expect(refusal([{ op: "renameSheet", sheet: "Sales", title: 5 } as unknown as SheetChange])).toBe(badTitle("renameSheet"));
+    expect(refusal([{ op: "duplicateSheet", sheet: "Sales", title: "" }])).toBe(badTitle("duplicateSheet"));
+    expect(prepareChanges([{ op: "addSheet", title: "x".repeat(100) }])).toHaveLength(1);
+  });
+
+  it("takes a sheet only by a title of 1 to 100 characters", () => {
+    let notATitle = "sheet must be a sheet's title, a string of 1 to 100 characters.";
+    for (let sheet of ["", "x".repeat(101), 0, null, undefined]) {
+      expect(refusal([{ op: "deleteSheet", sheet } as unknown as SheetChange])).toBe(`Change 1 (deleteSheet): ${notATitle}`);
+    }
+    // A sheet named by ID, as it once could be, names none.
+    expect(refusal([{ op: "insertRows", sheetId: 0, at: 1 } as unknown as SheetChange]))
+      .toBe(`Change 1 (insertRows): ${notATitle}`);
+    let title = "x".repeat(100);
+    expect(prepareChanges([{ op: "deleteSheet", sheet: title }])).toEqual([{ op: "deleteSheet", sheet: title }]);
+  });
+
+  it("refuses an index, row count or column count out of range", () => {
+    expect(refusal([{ op: "addSheet", title: "A", index: -1 }]))
+      .toBe("Change 1 (addSheet): index must be an integer 0 or more.");
+    expect(refusal([{ op: "duplicateSheet", sheet: "Sales", index: 0.5 }]))
+      .toBe("Change 1 (duplicateSheet): index must be an integer 0 or more.");
+    expect(refusal([{ op: "addSheet", title: "A", rowCount: 0 }]))
+      .toBe("Change 1 (addSheet): rowCount must be an integer from 1 to 10,000,000.");
+    expect(refusal([{ op: "addSheet", title: "A", columnCount: 18_279 }]))
+      .toBe("Change 1 (addSheet): columnCount must be an integer from 1 to 18,278.");
+    expect(prepareChanges([{ op: "addSheet", title: "A", columnCount: 18_278 }])).toHaveLength(1);
+  });
+
+  it("refuses at and count out of shape", () => {
+    expect(refusal([{ op: "insertRows", sheet: "Sales", at: 0 }]))
+      .toBe("Change 1 (insertRows): at must be an integer 1 or more.");
+    expect(refusal([{ op: "deleteRows", sheet: "Sales", at: "3" } as unknown as SheetChange]))
+      .toBe("Change 1 (deleteRows): at must be an integer 1 or more.");
+    for (let at of ["", "AAAA", "A1", 3]) {
+      expect(refusal([{ op: "insertColumns", sheet: "Sales", at } as unknown as SheetChange]))
+        .toBe('Change 1 (insertColumns): at must be the letters of a column, such as "C".');
+    }
+    expect(refusal([{ op: "insertRows", sheet: "Sales", at: 1, count: 1001 }]))
+      .toBe("Change 1 (insertRows): count must be an integer from 1 to 1,000.");
+    expect(refusal([{ op: "insertColumns", sheet: "Sales", at: "A", count: 0 }]))
+      .toBe("Change 1 (insertColumns): count must be an integer from 1 to 1,000.");
+    expect(refusal([{ op: "deleteColumns", sheet: "Sales", at: "A", count: 18_279 }]))
+      .toBe("Change 1 (deleteColumns): count must be an integer from 1 to 18,278.");
+    expect(refusal([{ op: "deleteRows", sheet: "Sales", at: 1, count: 2.5 }]))
+      .toBe("Change 1 (deleteRows): count must be an integer from 1 to 10,000,000.");
+    expect(prepareChanges([{ op: "deleteRows", sheet: "Sales", at: 1, count: 5000 }])).toHaveLength(1);
+  });
+
+  it("counts only the cells of value changes toward the batch's", () => {
+    let full = { op: "clearRange", range: "Sales!A1:J1000" } as const;
+    expect(prepareChanges([full, full, { op: "deleteRows", sheet: "Sales", at: 1, count: 100 }])).toHaveLength(3);
   });
 });

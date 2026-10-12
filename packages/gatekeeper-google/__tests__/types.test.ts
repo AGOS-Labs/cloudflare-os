@@ -197,6 +197,23 @@ const queued: Promise<void> = sheet.updateSpreadsheet([
 ]);
 // @ts-expect-error A change names its range.
 sheet.updateSpreadsheet([{ op: "clearRange" }]);
+sheet.updateSpreadsheet([
+  { op: "addSheet", title: "Q4", index: 1, rowCount: 100, columnCount: 5 },
+  { op: "writeCells", range: "'Q4'!A1", values: [["Forecast"]] },
+  { op: "renameSheet", sheet: "Q4", title: "Q4 2026" },
+  { op: "duplicateSheet", sheet: "Sales", title: "Copy", index: 2 },
+  { op: "insertRows", sheet: "Copy", at: 3, count: 2 },
+  { op: "deleteRows", sheet: "Sales", at: 5 },
+  { op: "insertColumns", sheet: "Sales", at: "C" },
+  { op: "deleteColumns", sheet: "Sales", at: "C", count: 2 },
+  { op: "deleteSheet", sheet: "Copy" },
+]);
+// @ts-expect-error Columns are named by their letters.
+sheet.updateSpreadsheet([{ op: "insertColumns", sheet: "Sales", at: 3 }]);
+// @ts-expect-error A sheet is named by its title, not its ID.
+sheet.updateSpreadsheet([{ op: "deleteSheet", sheet: 0 }]);
+// @ts-expect-error A sheet added needs a title.
+sheet.updateSpreadsheet([{ op: "addSheet" }]);
 `)
       // The agent's runtime provides the module Chat's declarations import.
       .filter(message => !message.includes("'cloudflare:workers'"))).toEqual([]);

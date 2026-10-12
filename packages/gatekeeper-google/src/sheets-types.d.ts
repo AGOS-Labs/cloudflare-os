@@ -16,7 +16,11 @@ export type * from "./sheets-read-types";
  */
 export type SheetCellInput = string | number | boolean | null;
 
-/** One change to a spreadsheet's cells. */
+/**
+ * One change to a spreadsheet's cells, rows, columns or sheets. A change to a sheet or its rows or
+ * columns names the sheet in `sheet` by its title, as `getSpreadsheet()` lists it (unquoted),
+ * including a title an earlier change in the batch gives a sheet.
+ */
 export type SheetChange =
   /** Enter values in every cell of a range. */
   | {
@@ -31,6 +35,91 @@ export type SheetChange =
       op: "clearRange";
       /** A bounded A1 range that names its sheet, such as `'Sales 2026'!A1:C3`. */
       range: string;
+    }
+  /** Add an empty sheet. */
+  | {
+      op: "addSheet";
+      /** Its title: 1 to 100 characters, and no other sheet's, ignoring case. */
+      title: string;
+      /** Its 0-based position among all sheets, hidden ones included. Last by default. */
+      index?: number;
+      /** Its number of rows: 1,000 by default, as in Google Sheets. */
+      rowCount?: number;
+      /** Its number of columns: 26 by default, as in Google Sheets. */
+      columnCount?: number;
+    }
+  /** Give a sheet another title. */
+  | {
+      op: "renameSheet";
+      /** The sheet renamed. */
+      sheet: string;
+      /** The new title: 1 to 100 characters, and no other sheet's, ignoring case. */
+      title: string;
+    }
+  /** Copy a sheet and its contents, the changes queued to it included. */
+  | {
+      op: "duplicateSheet";
+      /** The sheet copied. */
+      sheet: string;
+      /** The copy's title: `Copy of <title>` by default. */
+      title?: string;
+      /**
+       * The copy's 0-based position among all sheets, hidden ones included. Right after the sheet
+       * copied by default.
+       */
+      index?: number;
+    }
+  /**
+   * Delete a sheet and everything on it. The spreadsheet's last visible sheet cannot be deleted,
+   * nor, here, a sheet of more than 50,000 cells: delete that one in Google Sheets.
+   */
+  | {
+      op: "deleteSheet";
+      /** The sheet deleted. */
+      sheet: string;
+    }
+  /** Insert empty rows, formatted as the row before them (before row 1, as the row after). */
+  | {
+      op: "insertRows";
+      /** The sheet the rows are inserted in. */
+      sheet: string;
+      /** The 1-based row the new rows go before; the sheet's row count plus 1 adds them at the end. */
+      at: number;
+      /** How many rows: 1 to 1,000, 1 by default. */
+      count?: number;
+    }
+  /** Delete rows and their contents. A sheet keeps at least one row. */
+  | {
+      op: "deleteRows";
+      /** The sheet the rows are deleted from. */
+      sheet: string;
+      /** The 1-based first row deleted. */
+      at: number;
+      /** How many rows, 1 by default. */
+      count?: number;
+    }
+  /** Insert empty columns, formatted as the column before them (before column A, as the column after). */
+  | {
+      op: "insertColumns";
+      /** The sheet the columns are inserted in. */
+      sheet: string;
+      /**
+       * The letters of the column the new columns go before, such as `"C"`; those of the column
+       * after the last add them at the end.
+       */
+      at: string;
+      /** How many columns: 1 to 1,000, 1 by default. */
+      count?: number;
+    }
+  /** Delete columns and their contents. A sheet keeps at least one column. */
+  | {
+      op: "deleteColumns";
+      /** The sheet the columns are deleted from. */
+      sheet: string;
+      /** The letters of the first column deleted, such as `"C"`. */
+      at: string;
+      /** How many columns, 1 by default. */
+      count?: number;
     };
 
 /**
@@ -42,17 +131,26 @@ export type SheetChange =
  */
 export interface GoogleSpreadsheetSession extends GoogleSpreadsheetReadSession {
   /**
-   * Queue changes as one approval, applied in order, together or not at all.
+   * Queue changes as one approval, applied in order, together or not at all. Each change acts on
+   * the spreadsheet as the changes before it leave it. Every change names its sheet by title, as a
+   * range does, including a title an earlier change gives a sheet it adds or renames. Rows and
+   * columns, in ranges too, are numbered as earlier changes that insert or delete some leave them:
+   * to delete rows 3 and 7, delete row 7 first (or delete row 3, then row 6).
    *
    * The user may let a batch apply without asking only when it enters literal values and clears
-   * ranges; a batch with any formula waits for approval. Formulas calling `IMPORTRANGE`, which
-   * reads another spreadsheet, or `IMPORTDATA`, `IMPORTHTML`, `IMPORTXML`, `IMPORTFEED` or
-   * `IMAGE`, which make Google fetch a URL, are refused.
+   * ranges; a batch with any formula, or any change to rows, columns or sheets, waits for
+   * approval. Formulas calling `IMPORTRANGE`, which reads another spreadsheet, or `IMPORTDATA`,
+   * `IMPORTHTML`, `IMPORTXML`, `IMPORTFEED` or `IMAGE`, which make Google fetch a URL, are
+   * refused.
    *
    * A batch makes at most 50 changes, a change addresses at most 10,000 cells and a batch 20,000,
-   * and a cell holds at most 50,000 characters. The batch as queued, values included, must also
-   * fit in 100 KiB, about 50,000 characters of text in all. Changes writing outside a sheet's grid, or into a
-   * range the connected account may not edit, are refused, queuing nothing.
+   * and a cell holds at most 50,000 characters. A batch may overwrite or delete at most 50,000
+   * cells that are already there. The batch as queued, values included, must also fit in 100 KiB,
+   * about 50,000 characters of text in all. Changes writing outside a sheet's grid, or into a range
+   * the connected account may not edit, are refused, queuing nothing, as is any change to the rows,
+   * columns or tab of a sheet holding a range the account may not edit. A batch may also be refused
+   * while many changes are queued, and a read or a batch while changes to rows, columns or sheets
+   * are; approve or reject them first.
    *
    * Reads show queued changes as entered: formula reads show a queued formula as its text, and raw
    * reads show queued literal values. A queued formula's result, and in formatted reads a queued
@@ -60,6 +158,13 @@ export interface GoogleSpreadsheetSession extends GoogleSpreadsheetReadSession {
    * Formulas elsewhere keep showing their saved results. Google tidies the references in a
    * formula, upper-casing columns and quoting sheet titles its own way; the formula is shown
    * already tidied.
+   *
+   * Queued changes to rows, columns and sheets show in reads too: `getSpreadsheet()` lists the
+   * sheets as they leave them, cells read where those changes move them, and cells of inserted rows,
+   * columns and added sheets read blank. Formulas read as Google rewrites them. A saved formula's
+   * result reads `null` and is listed in `pendingCells` whenever the queued changes may alter it.
+   * Cells Google fills with nothing entered in them, such as an array formula's results, a `QUERY`
+   * or `FILTER` result or a pivot table, read `null` and are listed in `pendingCells` too.
    */
   updateSpreadsheet(changes: SheetChange[]): Promise<void>;
 }

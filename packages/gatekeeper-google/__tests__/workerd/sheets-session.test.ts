@@ -9,9 +9,11 @@ import { GoogleSheetsApi } from "../../src/sheets-api";
 import {
   GoogleSpreadsheetReadSessionImpl, GoogleSpreadsheetSessionImpl, NO_CHANGES,
 } from "../../src/sheets";
-import type { QueuedChange } from "../../src/sheets-simulation";
+import type { PlannedChange, QueuedChange } from "../../src/sheets-simulation";
 import type { GoogleSpreadsheetSession } from "../../src/sheets-types";
-import { ENTERED_READS, protectedRange, rect, sheet, spreadsheetMetadata } from "../sheets-fixture";
+import {
+  byDataFilter, ENTERED_READS, protectedRange, rect, sheet, spreadsheetMetadata, type FixtureGridRange,
+} from "../sheets-fixture";
 
 class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
   readonly observations: ObservationDescription[] = [];
@@ -42,11 +44,29 @@ const METADATA = spreadsheetMetadata("sheet-1", "Budget", [
 ]);
 
 let providerFetches: URL[];
+/** The body of each data-filter read of values, in order. */
+let dataFilterReads: {
+  dataFilters: { gridRange: Required<FixtureGridRange> }[];
+  valueRenderOption: string;
+  dateTimeRenderOption?: string;
+}[];
+/** The grid ranges of each read of cells as entered, in order. */
+let enteredReads: Required<FixtureGridRange>[][];
+
+/** The cells of `gridRange`, each named by its own sheet, row and column. */
+function named({ sheetId, startRowIndex, endRowIndex, startColumnIndex, endColumnIndex }: Required<FixtureGridRange>) {
+  return Array.from({ length: endRowIndex - startRowIndex }, (_row, r) =>
+    Array.from({ length: endColumnIndex - startColumnIndex }, (_column, c) =>
+      `${sheetId}:${startRowIndex + r}:${startColumnIndex + c}`));
+}
 
 beforeEach(() => {
   providerFetches = [];
+  dataFilterReads = [];
+  enteredReads = [];
   vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-    let url = new URL(new Request(input, init).url);
+    let request = new Request(input, init);
+    let url = new URL(request.url);
     providerFetches.push(url);
     if (url.hostname !== "sheets.googleapis.com") {
       throw new Error(`Unexpected provider request: ${url.origin}${url.pathname}`);
@@ -54,6 +74,30 @@ beforeEach(() => {
     if (url.pathname.endsWith("/values:batchGet")) {
       return Response.json({
         valueRanges: url.searchParams.getAll("ranges").map(range => ({ range, values: [["saved", 1]] })),
+      });
+    }
+    if (url.pathname.endsWith("/values:batchGetByDataFilter")) {
+      let body = await request.json() as (typeof dataFilterReads)[number];
+      dataFilterReads.push(body);
+      // Each cell holds its own sheet, row and column, so a test can tell which cell a value came from.
+      return Response.json(byDataFilter(body.dataFilters.map(({ gridRange }) => ({
+        gridRange, range: "", values: named(gridRange),
+      }))));
+    }
+    if (url.pathname.endsWith(":getByDataFilter")) {
+      let { dataFilters } = await request.json() as { dataFilters: { gridRange: Required<FixtureGridRange> }[] };
+      enteredReads.push(dataFilters.map(({ gridRange }) => gridRange));
+      // Each cell holds the text naming it; a sheet's entry lists a block per range on it.
+      let sheetIds = [...new Set(dataFilters.map(({ gridRange }) => gridRange.sheetId))].toSorted((a, b) => a - b);
+      return Response.json({
+        sheets: sheetIds.map(sheetId => ({
+          properties: { sheetId },
+          data: dataFilters.filter(({ gridRange }) => gridRange.sheetId === sheetId).map(({ gridRange }) => ({
+            startRow: gridRange.startRowIndex,
+            startColumn: gridRange.startColumnIndex,
+            rowData: named(gridRange).map(row => ({ values: row.map(stringValue => ({ userEnteredValue: { stringValue } })) })),
+          })),
+        })),
       });
     }
     // The fake honours only whether protected ranges were asked for; it never sends editors.
@@ -81,6 +125,17 @@ function queued(id: number, sheetId: number, cells: ReturnType<typeof rect>, val
         marker: { id: 1, token: "token" },
         guard: { sha256: "", after: [] },
       },
+    },
+  };
+}
+
+/** A queued batch making `changes`. */
+function queuedBatch(id: number, changes: PlannedChange[]): QueuedChange {
+  return {
+    id,
+    action: {
+      kind: "updateSpreadsheet",
+      payload: { changes, sheets: {}, marker: { id: 1, token: "token" }, guard: { sha256: "", after: [] } },
     },
   };
 }
@@ -138,7 +193,8 @@ describe("Google Sheets spreadsheet session", () => {
     // Each read fetches the metadata, to replay the queued change over, and the values.
     let metadata = ["/v4/spreadsheets/sheet-1",
       "spreadsheetId,properties(title,locale,timeZone)," +
-      "sheets(properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount))," +
+      "sheets(properties(sheetId,title,index,hidden," +
+      "gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount))," +
       "protectedRanges(range,unprotectedRanges,requestingUserCanEdit,warningOnly))"];
     let values = ["/v4/spreadsheets/sheet-1/values:batchGet", null];
     expect(requested().toSorted()).toEqual([metadata, metadata, metadata, values, values, values]);
@@ -185,6 +241,59 @@ describe("Google Sheets spreadsheet session", () => {
     let masks = providerFetches.flatMap(url => url.searchParams.getAll("fields"));
     expect(masks.some(mask => mask.includes("protectedRanges"))).toBe(true);
     expect(masks.filter(mask => mask.includes("editors"))).toEqual([]);
+  });
+
+  it("reads with rows and sheets queued by grid range, fetching only the cells Google holds", async () => {
+    let { session } = newSession([queuedBatch(1, [
+      { op: "renameSheet", sheetId: 0, title: "Renamed" },
+      { op: "insertRows", sheetId: 0, start: 1, count: 1 },
+    ])]);
+    using _session = session;
+
+    expect((await session.getSpreadsheet()).sheets[0])
+      .toEqual({ id: 0, title: "Renamed", index: 0, rowCount: 21, columnCount: 6 });
+    expect(await session.readRange("Renamed!A1:B3", { valueMode: "raw" })).toEqual({
+      range: "Renamed!A1:B3", values: [["0:0:0", "0:0:1"], [null, null], ["0:1:0", "0:1:1"]],
+    });
+
+    // No range names the title Google holds, so none is read by A1 range.
+    expect(providerFetches.filter(url => url.pathname.endsWith("/values:batchGet"))).toEqual([]);
+    // The inserted row splits the range into the two rows around it, read as entered too, to tell
+    // formulas from text.
+    let pieces = [
+      { sheetId: 0, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 2 },
+      { sheetId: 0, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: 2 },
+    ];
+    expect(dataFilterReads.map(({ dataFilters, valueRenderOption, dateTimeRenderOption }) =>
+      ({ gridRanges: dataFilters.map(({ gridRange }) => gridRange), valueRenderOption, dateTimeRenderOption })))
+      .toEqual([{ gridRanges: pieces, valueRenderOption: "UNFORMATTED_VALUE", dateTimeRenderOption: "SERIAL_NUMBER" }]);
+    expect(enteredReads).toEqual([pieces]);
+  });
+
+  it("fetches at most 20 pieces of what Google holds for a read with rows queued", async () => {
+    // A row inserted after each of the 20 rows Google holds.
+    let rows = queuedBatch(1, Array.from({ length: 20 }, (_, i): PlannedChange =>
+      ({ op: "insertRows", sheetId: 0, start: 2 * i + 1, count: 1 })));
+    let { session } = newSession([rows]);
+    using _session = session;
+
+    let read = await session.readRange("Sales!A1:A40", { valueMode: "formula" });
+
+    expect(read.values).toEqual(Array.from({ length: 40 }, (_, i) => [i % 2 === 0 ? `0:${i / 2}:0` : null]));
+    // A formula-mode read asks for the same two reads as any other mode.
+    expect(enteredReads.map(gridRanges => gridRanges.length)).toEqual([20]);
+    expect(dataFilterReads.map(({ dataFilters, valueRenderOption }) => [dataFilters.length, valueRenderOption]))
+      .toEqual([[20, "FORMULA"]]);
+
+    // A column inserted too splits each of those pieces in two.
+    let { session: split } = newSession([rows, queuedBatch(2, [{ op: "insertColumns", sheetId: 0, start: 1, count: 1 }])]);
+    using _split = split;
+    await expect(Promise.resolve(split.readRange("Sales!A1:C40"))).rejects.toThrow(
+      "These ranges cannot be read with the queued changes applied. Read fewer cells, or approve or " +
+      "reject the queued changes first.");
+    expect(enteredReads).toHaveLength(1);
+    expect(dataFilterReads).toHaveLength(1);
+    expect(providerFetches.filter(url => url.pathname.endsWith("/values:batchGet"))).toEqual([]);
   });
 
   it("gives a spreadsheet opened read-only no write method", async () => {
