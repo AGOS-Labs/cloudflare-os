@@ -432,6 +432,12 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
   }
 }
 
+/**
+ * A hook driver holding some of an account's hooks, which the account tells to drop them when it
+ * is disconnected: Gmail's per mailbox, Chat's per space.
+ */
+export type HookDriverRef = { kind: "gmail" | "chat"; name: string };
+
 /** What a reconnect flow obtains, held in escrow until commitReconnect() writes it live. */
 type StagedGoogleCredentials = {
   refreshToken: string;
@@ -716,6 +722,7 @@ export class UserAccount extends DurableObject<Env> {
   async alarm(_alarmInfo?: AlarmInvocationInfo): Promise<void> {
     await this.#credentials.run(async () => {
       if (shouldDeleteCredentialsOnAlarm(this.ctx.storage.kv)) {
+        await this.#forgetHooks();
         this.ctx.storage.deleteAll();
       }
     });
@@ -727,9 +734,46 @@ export class UserAccount extends DurableObject<Env> {
       if (refreshToken) {
         await revokeGoogleToken(refreshToken, AbortSignal.timeout(TOKEN_REVOKE_TIMEOUT_MS));
       }
+      await this.#forgetHooks();
       this.ctx.storage.deleteAlarm();
       this.ctx.storage.deleteAll();
     });
+  }
+
+  /**
+   * Note that `driver` holds hooks of this account, so that disconnecting it reaches them; false,
+   * noting nothing, once the account is disconnected, when no hook of it may be registered.
+   */
+  async trackHookDriver(driver: HookDriverRef): Promise<boolean> {
+    // Serialized with disconnecting, so that a driver is either noted before the account's drivers
+    // are told to drop its hooks, or refused once its credentials are gone.
+    return await this.#credentials.run(async () => {
+      if (!this.ctx.storage.kv.get<string>("refreshToken")) return false;
+      this.ctx.storage.kv.put(`hookDriver:${driver.kind}:${driver.name}`, driver);
+      return true;
+    });
+  }
+
+  /**
+   * Have every driver holding this account's hooks drop them. Their records are about to go with
+   * the credentials, and a driver would otherwise go on reading and renewing for them, failing
+   * every time. Best effort: a driver that can't be reached is logged rather than block the
+   * disconnect, and drops them itself within a day, when it next asks whether the account knows of
+   * it (see trackHookDriver()).
+   */
+  async #forgetHooks(): Promise<void> {
+    const userObjectId = this.ctx.id.toString();
+    const results = await Promise.allSettled(
+      [...this.ctx.storage.kv.list<HookDriverRef>({ prefix: "hookDriver:" })].map(([, { kind, name }]) =>
+        (kind === "gmail" ? this.ctx.exports.GmailHookDriver : this.ctx.exports.ChatHookDriver)
+          .getByName(name).forgetAccount(userObjectId)));
+    for (const result of results) {
+      if (result.status === "rejected") {
+        logger.warn("failed to drop a disconnected account's hooks", {
+          event: "hooks.account.forget.failed", error: result.reason,
+        });
+      }
+    }
   }
 }
 
