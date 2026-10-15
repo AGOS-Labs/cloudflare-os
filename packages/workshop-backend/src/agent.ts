@@ -3,7 +3,8 @@ import { applyCodeChange, codeChangeSerializedSize, MAX_CODE_CHANGE_SIZE, replac
   type CodeContent, type CodeChange, type FileChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
 import { AgentCatalog, ObservationDescription } from '@gadgets/workshop-shared/gatekeeper';
-import { createWorkshopLogger } from "./observability";
+import { createWorkshopLogger, obsContext } from "./observability";
+import { createTracer } from "@gadgets/observability/tracing";
 import {
   Type, getSystemMessageText, isRetryableAssistantError, toToolDeclaration,
 } from "@earendil-works/pi-ai";
@@ -41,6 +42,7 @@ import {
 import { formatGrep, type GrepScan } from "./grep";
 
 const logger = createWorkshopLogger("workshop.agent");
+const traced = createTracer(obsContext.get);
 
 /**
  * How much text one tool result may put in front of the model. About 8k tokens: a handful of
@@ -180,6 +182,11 @@ type AgentPassOutcome =
   | {type: "reloadForCompaction"}
   | {type: "compacted"; checkpoint: CompactionCheckpoint}
   | {type: "transientFailure"; error: AgentTurnError};
+
+type AgentProgress = {
+  executionId: string;
+  barrierSequence: number;
+};
 
 /**
  * Summary of one of the workspace's gadgets, as needed by the agent: identity and its named
@@ -1459,11 +1466,16 @@ export async function runAgent(
     abortSignal: AbortSignal,
     initiator: AiChatAuthorInfo,
     modelConfig: AiModelConfig): Promise<void> {
+  // Provider retries and compaction reloads are passes of this execution, not new executions.
+  const progress: AgentProgress = {
+    executionId: crypto.randomUUID(),
+    barrierSequence: 0,
+  };
   let retries = 0;
   while (true) {
     let history = hooks.loadChatHistory(chatId);
     let outcome = await runAgentPass(
-        hooks, handle, chatId, author, history, abortSignal, initiator, modelConfig);
+        hooks, handle, chatId, author, history, abortSignal, initiator, modelConfig, progress);
     if (outcome.type === "transientFailure") {
       if (++retries > TRANSIENT_FAILURE_RETRIES) throw outcome.error;
       // The failed request persisted nothing, so the retry starts from the last saved step. What
@@ -1485,7 +1497,9 @@ async function runAgentPass(
     {checkpoint, chatMessages, measuredTokens}: ChatHistory,
     abortSignal: AbortSignal,
     initiator: AiChatAuthorInfo,
-    modelConfig: AiModelConfig): Promise<AgentPassOutcome> {
+    modelConfig: AiModelConfig,
+    progress: AgentProgress): Promise<AgentPassOutcome> {
+  const progressLogger = logger.with({chatId, executionId: progress.executionId});
 
   // The workspace's gadget registry, snapshotted at the start of the turn (gadgets provisional
   // to other chats are excluded -- they belong to those chats' proposed changes). This is the
@@ -2801,6 +2815,24 @@ async function runAgentPass(
   // barrier persists the action before the loop ends and waits for approval to resume it.
   let awaitingActionDecision = false;
 
+  // JavaScript clocks can be frozen through synchronous SQL/apply work in production. Let the
+  // runtime span own timing; the logs identify phase/order, not a duration or a disk-flush ACK.
+  let persistStep = <T>(operation: () => Promise<T>): Promise<T> => traced("agent.step.persist", async span => {
+    const sequence = ++progress.barrierSequence;
+    span.setAttribute("chatId", chatId);
+    span.setAttribute("executionId", progress.executionId);
+    span.setAttribute("sequence", sequence);
+    progressLogger.debug("agent persistence started", {event: "agent.step.persist.started", sequence});
+    try {
+      const result = await operation();
+      progressLogger.debug("agent persistence completed", {event: "agent.step.persist.completed", sequence});
+      return result;
+    } catch (error) {
+      progressLogger.debug("agent persistence failed", {event: "agent.step.persist.failed", sequence});
+      throw error;
+    }
+  });
+
   // Buffer one file edit into the step and apply it to the session content; it becomes durable
   // (row + broadcast) only at the step's persistence barrier. The first write to an unpinned
   // gadget with committed code pins it at the given head -- always the current head, never the
@@ -4095,27 +4127,29 @@ async function runAgentPass(
         // The barrier itself: one transaction persists the step's messages and its buffered
         // effects -- rows, the step's single "changes" message, retirement, registry stamps --
         // so the effects are durable iff the transcript that explains them is. The buffer is
-        // drained before the call: if the barrier throws, the turn dies with it (rethrown out
-        // of the loop), and re-delivering the step's changes anywhere would be wrong.
-        let stepChanges = stepBuffer.changes;
-        stepBuffer.changes = [];
-        stepBuffer.bytes = 0;
-        let createdGadgets = pendingCreatedGadgets;
-        pendingCreatedGadgets = [];
-        let createdWorktrees = pendingCreatedWorktrees;
-        pendingCreatedWorktrees = [];
-        let addedBindings = pendingAddedBindings;
-        pendingAddedBindings = [];
-        let worktreeCommits = pendingWorktreeCommits;
-        pendingWorktreeCommits = [];
-        let blueprintMerges = pendingBlueprintMerges;
-        pendingBlueprintMerges = [];
-        if (await hooks.commitAgentStep(chatId, author, msgs,
-            {changes: stepChanges, createdGadgets, createdWorktrees, addedBindings,
-             worktreeCommits, blueprintMerges},
-            message.usage, handle.lastResponse?.aiGatewayLogId, handle.aiGatewayLogRoute)) {
-          ++nextChangeId;
-        }
+        // drained before the call. If the barrier throws, the turn dies with it, and re-delivering
+        // the effects would be wrong.
+        await persistStep(async () => {
+          let stepChanges = stepBuffer.changes;
+          stepBuffer.changes = [];
+          stepBuffer.bytes = 0;
+          let createdGadgets = pendingCreatedGadgets;
+          pendingCreatedGadgets = [];
+          let createdWorktrees = pendingCreatedWorktrees;
+          pendingCreatedWorktrees = [];
+          let addedBindings = pendingAddedBindings;
+          pendingAddedBindings = [];
+          let worktreeCommits = pendingWorktreeCommits;
+          pendingWorktreeCommits = [];
+          let blueprintMerges = pendingBlueprintMerges;
+          pendingBlueprintMerges = [];
+          if (await hooks.commitAgentStep(chatId, author, msgs,
+              {changes: stepChanges, createdGadgets, createdWorktrees, addedBindings,
+               worktreeCommits, blueprintMerges},
+              message.usage, handle.lastResponse?.aiGatewayLogId, handle.aiGatewayLogRoute)) {
+            ++nextChangeId;
+          }
+        });
 
         // Reset per-step streaming state.
         toolCallNotes.clear();
