@@ -4694,8 +4694,7 @@ class OverseerImpl implements AgentHooks {
 
   // The git cache's pull delegate (see GitPullDelegate): reaches the gatekeeper through its
   // instantiated facet -- the same path every other invocation of an existing gatekeeper uses --
-  // and hands it a cache stub scoped to itself, so everything it put()s or advertises is
-  // attributed to it.
+  // and ingests its pack with that source's provenance and the DO cache's existing limits.
   async #pullGitObjects(gatekeeperId: WorkpieceId, oids: string[], hints: GitPullHints)
       : Promise<void> {
     if (this.storage.gatekeepers.get(gatekeeperId) === undefined) {
@@ -4708,7 +4707,27 @@ class OverseerImpl implements AgentHooks {
     // call, which the pull driver treats as this source failing.
     let facet = await this.getGatekeeperFacet(gatekeeperId) as unknown as
         Fetcher<Gatekeeper<any> & Required<Pick<Gatekeeper<any>, "gitPull">>>;
-    await facet.gitPull(oids, new GitCacheImpl(this.gitCache, gatekeeperId), hints);
+    using transfer = await facet.gitPull(oids, hints);
+    const pack = await transfer.stream();
+    let stored: Set<string>;
+    try {
+      stored = new Set(await this.gitCache.consumePackFromGatekeeper(gatekeeperId, pack));
+    } catch (error) {
+      // A stream exception crossing Workers RPC can turn into "Network connection lost".
+      // The producer records its real protocol error before rejecting the stream.
+      const status = await transfer.status().catch(() => undefined);
+      if (status?.state === "failed") throw new Error(status.message, {cause: error});
+      throw error;
+    }
+    const status = await transfer.status();
+    if (status.state === "failed") throw new Error(status.message);
+    if (status.state !== "complete") {
+      throw new Error(`git fetch ended without a completed transfer (${status.state})`);
+    }
+    const missing = oids.filter(oid => !stored.has(oid));
+    if (missing.length > 0 && !(hints.type === "blob" && hints.filterBlobSize !== undefined)) {
+      throw new Error(`git fetch did not provide the requested objects: ${missing.join(", ")}`);
+    }
   }
 
   // Apply a single pending action: invoke the gatekeeper, mark it approved, and persist (the put
