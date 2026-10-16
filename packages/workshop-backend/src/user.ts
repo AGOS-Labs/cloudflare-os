@@ -1617,12 +1617,33 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         .selectableGatekeeperUsers(record.vendorId);
   }
 
+  /**
+   * Make the account's grant cover the resource types `resourceUrlPatterns` names. Only the
+   * gatekeeper knows what it was granted, so it decides: it returns the URL of a consent flow that
+   * widens the grant, opened here as a connect flow, or no URL when the grant already covers them.
+   */
   async ensureAccountResources(accountId: number, resourceUrlPatterns: string[])
       : Promise<ConnectFlowStart | null> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
     let { url } = await record.account.ensureResources(resourceUrlPatterns);
-    if (url === undefined) return null;
+    if (url === undefined) {
+      // Nothing to grant, yet callers ask for what the account's stored description doesn't list as
+      // granted, so that list is out of date. A gatekeeper that renames a resource type's
+      // `urlPattern` reads the grants it recorded under the new name, but the description stored
+      // here keeps the old one until it is fetched again. Fetch it now, or the UI keeps offering a
+      // grant the account already has. Best-effort: null still means nothing needed granting.
+      try {
+        let description = await record.account.describe();
+        let current = this.storage.connectedAccounts.get(accountId);
+        if (current) this.storage.connectedAccounts.put({ ...current, description });
+      } catch (err) {
+        logger.warn("failed to refresh a stale account description", {
+          event: "account.describe.refresh.failed", vendorId: record.vendorId, accountId, error: err,
+        });
+      }
+      return null;
+    }
     return { url, nonce: await this.openConnectFlow(accountId) };
   }
 

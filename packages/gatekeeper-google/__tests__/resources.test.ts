@@ -35,8 +35,8 @@ describe("resource declarations", () => {
       "https://drive.google.com/drive/folders/:folderId",
       "https://drive.google.com/file/d/:fileId/view",
       "https://chat.google.com/",
-      "https://chat.google.com/room/:spaceId",
-      "https://chat.google.com/room/:spaceId/:threadId",
+      "https://chat.google.com/:kind(room|dm)/:spaceId",
+      "https://chat.google.com/:kind(room|dm)/:spaceId/:threadId{/:messageId}?",
       "https://bigquery.googleapis.com/:projectId/*",
     ]);
   });
@@ -603,6 +603,18 @@ describe("parseResourceUrl", () => {
         { kind: "chatThread", spaceId: "AAAA1234", threadId: "TTT" }],
       ["one thread with a trailing slash", "https://chat.google.com/room/AAAA1234/TTT/",
         { kind: "chatThread", spaceId: "AAAA1234", threadId: "TTT" }],
+      // Chat's own links add a `cls` view parameter, which names no resource.
+      ["one conversation from a link Chat gave out", "https://chat.google.com/room/AAAA1234?cls=7",
+        { kind: "chatSpace", spaceId: "AAAA1234" }],
+      ["one thread from a link Chat gave out", "https://chat.google.com/room/AAAA1234/TTT?cls=10",
+        { kind: "chatThread", spaceId: "AAAA1234", threadId: "TTT" }],
+      ["one thread from a message's link", "https://chat.google.com/room/AAAA1234/TTT/MMM?cls=10",
+        { kind: "chatThread", spaceId: "AAAA1234", threadId: "TTT" }],
+      // Chat links to a direct message under /dm/ rather than /room/.
+      ["one direct message", "https://chat.google.com/dm/AAAA1234?cls=7",
+        { kind: "chatSpace", spaceId: "AAAA1234" }],
+      ["one thread from a direct message's link", "https://chat.google.com/dm/AAAA1234/TTT/MMM?cls=10",
+        { kind: "chatThread", spaceId: "AAAA1234", threadId: "TTT" }],
     ] as const)("scopes to %s", (_name, url, expected) => {
       expect(parseResourceUrl(url)).toEqual(expected);
     });
@@ -612,14 +624,14 @@ describe("parseResourceUrl", () => {
     it.each([
       "https://chat.google.com/room/",
       "https://chat.google.com/room/AAA%2F..%2FBBB",
-      "https://chat.google.com/room/AAA/BBB/CCC",
+      "https://chat.google.com/room/AAA/BBB/CCC/DDD",
       "https://chat.google.com/room/AAA/B%2FC",
       "https://chat.google.com/room/AAA/...",
-      "https://chat.google.com/dm/AAAA1234/TTT",
-      "https://chat.google.com/room/AAAA1234/TTT?cls=10",
-      "https://chat.google.com/dm/AAAA1234",
+      "https://chat.google.com/dm/",
+      "https://chat.google.com/dm/AAA/BBB/CCC/DDD",
       "https://chat.google.com/u/0/",
-      // A grant is keyed on the canonical URL, so noise is refused rather than normalized.
+      // Anything but Chat's own view parameter is refused rather than guessed at.
+      "https://chat.google.com/room/AAAA1234?cls=7&tab=1",
       "https://chat.google.com/?tab=1",
       "https://chat.google.com/room/AAAA1234#frag",
     ])("rejects %s", url => {
@@ -631,6 +643,9 @@ describe("parseResourceUrl", () => {
         ["https://chat.google.com/", GOOGLE_CHAT_RESOURCE],
         ["https://chat.google.com/room/AAAA1234", GOOGLE_CHAT_SPACE_RESOURCE],
         ["https://chat.google.com/room/AAAA1234/TTT", GOOGLE_CHAT_THREAD_RESOURCE],
+        ["https://chat.google.com/room/AAAA1234/TTT/MMM", GOOGLE_CHAT_THREAD_RESOURCE],
+        ["https://chat.google.com/dm/AAAA1234", GOOGLE_CHAT_SPACE_RESOURCE],
+        ["https://chat.google.com/dm/AAAA1234/TTT/MMM", GOOGLE_CHAT_THREAD_RESOURCE],
       ] as const) {
         for (const resource of SUPPORTED_RESOURCES) {
           expect(new URLPattern(resource.urlPattern).test(url)).toBe(resource === expected);
@@ -727,5 +742,18 @@ describe("recorded account grants", () => {
     };
     expect(recordedResourceUrlPatterns(grant)).toEqual([GMAIL_RESOURCE.urlPattern]);
     expect(grantedResourceUrlPatterns(grant)).toEqual([GMAIL_RESOURCE.urlPattern]);
+  });
+
+  it("carries a grant recorded under a pattern a later deploy renamed", () => {
+    const renamed = [GOOGLE_CHAT_SPACE_RESOURCE.urlPattern, GOOGLE_CHAT_THREAD_RESOURCE.urlPattern];
+    const grant = {
+      resourceUrlPatterns: [
+        "https://chat.google.com/room/:spaceId",
+        "https://chat.google.com/room/:spaceId/:threadId",
+      ],
+      oauthScopes: resourceUrlPatternsToOAuthScopes(renamed),
+    };
+    expect(recordedResourceUrlPatterns(grant)).toEqual(renamed);
+    expect(grantedResourceUrlPatterns(grant)).toEqual(renamed);
   });
 });
