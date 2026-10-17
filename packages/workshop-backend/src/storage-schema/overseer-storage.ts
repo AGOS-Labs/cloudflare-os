@@ -587,6 +587,12 @@ export type AiChatAgentContext = {
    */
   alwaysAvailableCapsuleIds?: WorkpieceId[];
 
+  /** Chat-private Git worktree for uploads, plans, and other agent working files. */
+  scratch?: {worktreeId: WorkpieceId, bindingName: string};
+
+  /** Legacy originals have been published as blobs and projected into this chat's scratch worktree. */
+  attachmentsMigrated?: true;
+
   /**
    * The part of the agent's system prompt that lists the workspace's gadgets, each with its files
    * and bindings, saved when the chat's first turn built it.
@@ -828,17 +834,26 @@ export type ExternalChatRecord = {
 type ChatAttachmentContentRecord = {
   fileId: string;
   data: Uint8Array;
-  state:
-    | {
-        type: "staged";
-        uploadedAt: number;
-        mimeType: string;
-        name?: string;
-      }
-    | {
-        type: "committed";
-        chatId: number;
-      };
+  state: {
+    type: "staged";
+    uploadedAt: number;
+    mimeType: string;
+    name?: string;
+  };
+} | {
+  fileId: string;
+  /** Retained for inline image previews and legacy attachments committed before Git ingress. */
+  data?: Uint8Array;
+  state: {
+    type: "committed";
+    chatId: number;
+    /** Original upload blob; new uploads keep no separate attachment byte copy. */
+    oid?: string;
+    /** Path in the chat's scratch worktree, independent of the uploaded file's format. */
+    workspacePath?: string;
+    /** Legacy immutable Git source commit for replay and download. */
+    workspaceCommitId?: string;
+  };
 };
 
 // =======================================================================================
@@ -1476,9 +1491,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
         primaryKey: "id"
       }),
 
-      // Attachment bytes. Before an attachment is committed to a chat message, this also carries
-      // the temporary metadata needed to construct its ChatAttachmentRef. Once committed, the
-      // message owns that metadata and this record retains only the bytes and owning chat ID.
+      // Chat-scoped attachment source metadata. New uploads point to immutable Git blobs;
+      // legacy records can still hold staged or committed bytes.
       chatAttachmentContent: collection<ChatAttachmentContentRecord>()({
         primaryKey: "fileId",
         nonUniqueIndexes: {
