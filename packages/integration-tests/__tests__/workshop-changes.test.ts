@@ -745,7 +745,7 @@ it.concurrent("agent code runs the gadget edits made in earlier steps of its tur
   } });
   const run = (id: string): ChatCompletionStep => ({ toolCall: {
     id, name: "executeCode",
-    arguments: { code: "export default async function(self, env) { return await env.APP.version(); }" },
+    arguments: { code: "export default async function(self, env) { return await env.APP.rpc.version(); }" },
   } });
   const model = models.script([
     toolCall("createGadget", { title: "App", bindingName: "APP" }),
@@ -760,4 +760,36 @@ it.concurrent("agent code runs the gadget edits made in earlier steps of its tur
   expect(history.flatMap(message => message.type === "message" ? message.toolCalls ?? [] : [])
       .flatMap(call => call.toolName === "executeCode" ? [call.output] : []))
       .toEqual([expect.stringContaining("v1"), expect.stringContaining("v2")]);
+});
+
+it.concurrent("agent code exports a gadget it is building through its binding's exports", async () => {
+  // The export reads the gadget's server, so its content proves which code ran: the draft this
+  // turn wrote, not mainline (where the gadget doesn't exist yet).
+  const exportingServer = `import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";\n` +
+      `export class Gadget extends DurableObject {\n  rows() { return "a,b\\n1,2\\n"; }\n}\n` +
+      `export class ExportHandler extends WorkerEntrypoint {\n` +
+      `  async getExportFormats(_gadget) {\n` +
+      `    return [{ id: "csv", label: "CSV", mode: "server", contentType: "text/csv", fileExtension: ".csv" }];\n` +
+      `  }\n` +
+      `  async export(gadget, _id) { return new Response(await gadget.rows()).body; }\n` +
+      `}\n`;
+  const model = models.script([
+    toolCall("createGadget", { title: "App", bindingName: "APP" }),
+    toolCall("writeFile", { workpiece: "APP", filename: "server.js", content: exportingServer }),
+    toolCall("executeCode", { code: `export default async function(self, env) {
+  let formats = await env.APP.exports.getFormats();
+  console.log("formats:", formats.map(format => format.id).join(","));
+  console.log("csv:", JSON.stringify(await new Response(await env.APP.exports.export("csv")).text()));
+}` }),
+    { text: "Done." },
+  ]);
+  await using session = await openAgentSession(harness.url, {
+    modelId: SCRIPTED_MODEL_ID, userModel: model.userModel,
+  });
+  const { outcome, history } = await session.runTurn("Build an app and export it as CSV.");
+  expect(outcome).toEqual({ status: "completed" });
+  const [output] = history.flatMap(message => message.type === "message" ? message.toolCalls ?? [] : [])
+      .flatMap(call => call.toolName === "executeCode" ? [call.output] : []);
+  expect(output).toContain("formats: csv");
+  expect(output).toContain(`csv: "a,b\\n1,2\\n"`);
 });

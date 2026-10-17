@@ -47,8 +47,10 @@ import {
 import { AgentGadgetInfo, AgentHooks, SeedBindingInfo, agentCodeChangeShape, alwaysAvailableResources, formatMissingBlueprintBindings, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
 import { WorktreeSessionImpl } from "./worktree-session";
 import { GitImpl } from "./git-binding";
+import { GadgetExportsImpl } from "./exports-session";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
+import EXPORTS_BINDING_TYPES from "./exports-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
 import { chatChangeStatuses, foldCompactedCode } from "./agent-compaction";
 import { ambientGatekeeperMode } from "./provisioning-policy";
@@ -106,17 +108,19 @@ export default class extends WorkerEntrypoint {
   async run(self, restoreForger) {
     let env = this.env;
     if (restoreForger) {
-      // Graft the well-known \`restore\` symbol onto each service-binding stub in env, so the
-      // executed code can call \`env.SOME_GADGET[restore](params)\` to forge a persistent stub
-      // targeting that gadget's [restore]() method. The symbol property is defined per-instance
-      // (not on the shared prototype) so only this execution's own bindings offer it, and it is
-      // invisible to RPC serialization, so passing a binding over RPC is unaffected. The
-      // capability itself is \`restoreForger\`, a transient stub scoped to this run() call; the
-      // overseer resolves the binding name back to the target gadget (and rejects non-gadget
-      // bindings with an instructive error).
+      // Graft the well-known \`restore\` symbol onto each service-binding stub in env -- for a
+      // gadget binding, its \`rpc\` stub -- so the executed code can call
+      // \`env.SOME_GADGET.rpc[restore](params)\` to forge a persistent stub targeting that
+      // gadget's [restore]() method. The symbol property is defined per-instance (not on the
+      // shared prototype) so only this execution's own bindings offer it, and it is invisible to
+      // RPC serialization, so passing a binding over RPC is unaffected. The capability itself is
+      // \`restoreForger\`, a transient stub scoped to this run() call; the overseer resolves the
+      // binding name back to the target gadget (and rejects non-gadget bindings with an
+      // instructive error).
       for (let [name, value] of Object.entries(env)) {
-        if (value?.constructor?.name === "Fetcher") {
-          Object.defineProperty(value, restore, {
+        let stub = value?.rpc?.constructor?.name === "Fetcher" ? value.rpc : value;
+        if (stub?.constructor?.name === "Fetcher") {
+          Object.defineProperty(stub, restore, {
             value: params => restoreForger.forge(name, params),
           });
         }
@@ -203,7 +207,7 @@ interface RestoreForgerEntrypoint extends WorkerEntrypoint {
 }
 
 // The capability handed to CODE_MODE_HARNESS's run() that lets executed code invoke
-// `env.<name>[restore](params)`. Only executeCode receives this capability -- gadget workers
+// `env.<name>.rpc[restore](params)`. Only executeCode receives this capability -- gadget workers
 // never do -- and it's passed as a transient stub argument to run(), so it lives exactly as
 // long as the execution. The binding name is resolved against the execution's own binding map
 // on the overseer side, so the capability conveys no authority beyond the env it accompanies.
@@ -339,14 +343,13 @@ function connectionTypeFromCreationSpec(
   }
 }
 
-// The agent-facing section of the worktree binding's type definitions: worktree-binding.txt is
-// a symlink to worktree-binding.d.ts shipped as a text module (the agent-spawner-binding.txt
-// pattern), and describeBinding serves everything below the marker.
-const WORKTREE_AGENT_API_MARKER = "// ---- BEGIN AGENT API ----\n";
-function worktreeAgentApiText(): string {
-  let index = WORKTREE_BINDING_TYPES.indexOf(WORKTREE_AGENT_API_MARKER);
-  return index < 0 ? WORKTREE_BINDING_TYPES
-      : WORKTREE_BINDING_TYPES.slice(index + WORKTREE_AGENT_API_MARKER.length).trimStart();
+// The agent-facing section of a binding's type definitions: worktree-binding.txt and
+// exports-binding.txt are symlinks to their .d.ts files shipped as text modules (the
+// agent-spawner-binding.txt pattern), and describeBinding serves everything below the marker.
+const AGENT_API_MARKER = "// ---- BEGIN AGENT API ----\n";
+function agentApiText(types: string): string {
+  let index = types.indexOf(AGENT_API_MARKER);
+  return index < 0 ? types : types.slice(index + AGENT_API_MARKER.length).trimStart();
 }
 
 // Compact kind label for a blueprint binding, used in agent-facing blueprint listings.
@@ -2514,7 +2517,8 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Build the agent's executeCode env from the chat's binding map: each name resolves to a
-  // gadget's RPC stub, a gatekeeper session stub, or an agent callback's stored arguments.
+  // gadget's `{rpc, exports}` pair, a gatekeeper session stub, or an agent callback's stored
+  // arguments.
   // Entries whose targets no longer exist are silently skipped, mirroring the deleted-gadget
   // behavior elsewhere. `executionId` is the calling executeCodeMode run, minted into worktree
   // loopbacks so they are usable only from within that execution.
@@ -2545,7 +2549,10 @@ class OverseerImpl implements AgentHooks {
         case "workpiece": {
           let record = this.storage.gadgets.get(entry.id);
           if (record?.type === "gadget") {
-            env[name] = this.makeBindingLoopback({type: "gadget", id: entry.id}, caller);
+            env[name] = {
+              rpc: this.makeBindingLoopback({type: "gadget", id: entry.id}, caller),
+              exports: this.makeBindingLoopback({type: "exports", id: entry.id}, caller),
+            };
           } else if (record?.type === "worktree") {
             // The programmatic Worktree binding (see worktree-session.ts). Served through the
             // loopback like every binding, resolving against this execution's registered
@@ -5104,6 +5111,15 @@ class OverseerImpl implements AgentHooks {
             new WorktreeSessionImpl(this, target.id, turn.access, async () => initiator));
       }
 
+      case "exports":
+        if (caller.from !== "agent") {
+          // Currently unreachable, since the gadget export API is only exposed
+          // to the workshop agent.
+          throw new Error("Gadget exports are only available to the agent's executeCode.");
+        }
+        this.#getOrCreateCapturedActions(caller.chatId).accessedGadget = true;
+        return Promise.resolve(new GadgetExportsImpl(this, target.id, caller.chatId));
+
       case "git":
         return Promise.resolve(new GitImpl(this, () => this.#gitAuthorFor(caller)));
 
@@ -5562,7 +5578,7 @@ class OverseerImpl implements AgentHooks {
 
     // Which gadget does this hook wake (for bookkeeping; the callback itself already
     // encapsulates the correct restore target)? A gadget caller names itself. An agent caller
-    // forged the callback via `env.<GADGET>[restore]` during the currently-running executeCode
+    // forged the callback via `env.<GADGET>.rpc[restore]` during the currently-running executeCode
     // invocation, so when exactly one gadget had a stub forged there, attribute the hook to it;
     // otherwise (or for other callers) fall back to the workspace's first gadget.
     // TODO: Replace this heuristic with introspection of the callback stub's actual restore
@@ -6507,16 +6523,24 @@ class OverseerImpl implements AgentHooks {
           `env.${envName} implements the \`Worktree\` interface as defined below:\n` +
           `\n` +
           `\`\`\`\n` +
-          `${worktreeAgentApiText()}` +
+          `${agentApiText(WORKTREE_BINDING_TYPES)}` +
           `\`\`\`\n`;
     }
     if (gadget) {
       return `Binding: ${envName}\n` +
           `\n` +
-          `This binding is an RPC stub that points at the main Durable Object instance of the ` +
-          `Gadget ${JSON.stringify(gadget.title)}. Calling a method on the stub invokes the ` +
-          `same-named method on the class exported by the Gadget's server.js (read that file to ` +
-          `learn the API it offers).`;
+          `This binding gives access to the Gadget ${JSON.stringify(gadget.title)}. It has two ` +
+          `properties:\n` +
+          `\n` +
+          `* \`${envName}.rpc\` is an RPC stub that points at the main Durable Object instance ` +
+          `of the Gadget. Calling a method on the stub invokes the same-named method on the ` +
+          `class exported by the Gadget's server.js (read that file to learn the API it offers).\n` +
+          `* \`${envName}.exports\` exports the Gadget as a file. It implements the ` +
+          `\`GadgetExports\` interface as defined below:\n` +
+          `\n` +
+          `\`\`\`\n` +
+          `${agentApiText(EXPORTS_BINDING_TYPES)}` +
+          `\`\`\`\n`;
     }
     let gatekeeper = this.storage.gatekeepers.get(id);
     if (!gatekeeper) {
@@ -6534,7 +6558,7 @@ class OverseerImpl implements AgentHooks {
         `binding. It implements the \`Git\` interface as defined below:\n` +
         `\n` +
         `\`\`\`\n` +
-        `${worktreeAgentApiText()}` +
+        `${agentApiText(WORKTREE_BINDING_TYPES)}` +
         `\`\`\`\n`;
   }
 
@@ -9548,7 +9572,7 @@ class OverseerImpl implements AgentHooks {
   #forgedRestoreTargets = new Map<number, Set<WorkpieceId>>();
 
   // Forge a persistent stub that restores through the gadget's [restore](params) method. The
-  // executeCode harness routes `env.<bindingName>[restore](params)` here (via RestoreForgerImpl);
+  // executeCode harness routes `env.<bindingName>.rpc[restore](params)` here (via RestoreForgerImpl);
   // `bindings` is that execution's own binding map, so the name conveys exactly the env the
   // executed code already holds.
   async forgeRestoreStubForBinding(
@@ -10289,6 +10313,10 @@ type BindingLoopbackTarget = {
 } | {
   // The `env.GIT` binding (see git-binding.ts).
   type: "git";
+} | {
+  // A gadget binding's `exports` in the agent's executeCode env (see exports-session.ts).
+  type: "exports";
+  id: WorkpieceId;
 };
 
 /**

@@ -258,7 +258,15 @@ async function describeBinding(
   let edge = info.bindings.find(binding => binding.name === name);
   if (edge) return hooks.describeBinding(envName, edge.target);
   if (name === GIT_BINDING_NAME) return hooks.describeGitBinding(envName);
-  if (name === "GADGET") return hooks.describeBinding(envName, info.id);
+  if (name === "GADGET") {
+    // Unlike the gadget bindings in the agent's env, a gadget's env.GADGET is
+    // the bare RPC stub.
+    return `Binding: ${envName}\n` +
+        `\n` +
+        `This binding is an RPC stub that points at the main Durable Object instance of the ` +
+        `Gadget ${JSON.stringify(info.title)} itself. Calling a method on the stub invokes the ` +
+        `same-named method on the class exported by the Gadget's server.js.`;
+  }
   throw new Error(`Gadget ${gadget} has no binding named "${name}".`);
 }
 
@@ -850,18 +858,18 @@ let greeter = await this.ctx.restore({type: "greeter", greeting: "Howdy"});
 await this.env.SOME_BINDING.registerGreeter(greeter);
 \`\`\`
 
-Typically, though, a Gadget doesn't register hooks from within its own code. Instead, you will probably want to register a hook once as part of an \`executeCode\` tool call. To facilitate this, within an \`executeCode\` invocation you have the ability to directly invoke each Gadget's restore method via its RPC stub. This is not normally possible over RPC, but the \`executeCode\` environment has been set up to make it possible. You can thus call a gadget's restorer in an \`executeCode\` invocation by providing code like:
+Typically, though, a Gadget doesn't register hooks from within its own code. Instead, you will probably want to register a hook once as part of an \`executeCode\` tool call. To facilitate this, within an \`executeCode\` invocation you have the ability to directly invoke each Gadget's restore method via its \`rpc\` stub. This is not normally possible over RPC, but the \`executeCode\` environment has been set up to make it possible. You can thus call a gadget's restorer in an \`executeCode\` invocation by providing code like:
 
 \`\`\`
 import { restore } from "cloudflare:workers";
 
 export default async function(self, env, ctx) {
-  let greeter = await env.MY_GADGET[restore]({type: "greeter", greeting: "Howdy"});
+  let greeter = await env.MY_GADGET.rpc[restore]({type: "greeter", greeting: "Howdy"});
   await env.SOME_BINDING.registerGreeter(greeter);
 }
 \`\`\`
 
-The call to \`env.MY_GADGET[restore](params)\` is equivalent to calling \`this.ctx.restore(params)\` from within the Gadget itself. This returns a persistent stub which you can then use as a hook callback.
+The call to \`env.MY_GADGET.rpc[restore](params)\` is equivalent to calling \`this.ctx.restore(params)\` from within the Gadget itself. This returns a persistent stub which you can then use as a hook callback.
 
 A Gadget can hold many persistent stubs at once, such as one hook per conversation it watches. Each is restored from its own \`params\`, so put whatever tells them apart there.
 `.trim();
@@ -876,6 +884,10 @@ You were started programmatically by the Gadget to perform a task, described bel
 Typically (but not always), you will need to use the \`executeCode\` tool to complete the task, invoking the available bindings (members of the env object) and other APIs available to you.
 
 Your \`env\` always contains \`env.GIT\`, which provides programmatic access to git commits known to the workspace (read a commit's metadata and files, edit them, and write new commits). Use \`describeBinding\` to learn its API if you need it.
+
+# Persistent Stubs and \`ctx.restore()\`
+
+Some APIs (especially hooks) take a "persistent" stub: one that can be stored and restored later through a Gadget's \`[restore](params)\` method. In \`executeCode\`, create one with \`env.MY_GADGET.rpc[restore](params)\` (after \`import { restore } from "cloudflare:workers"\`), which is equivalent to the Gadget calling \`this.ctx.restore(params)\`. The Gadget's server.js must define a \`[restore](params)\` method that returns the target for those params.
 `.trim();
 
 // The tools offered to a spawned agent (see runAgentPass). Anything that modifies a gadget or
@@ -1244,7 +1256,7 @@ let EXECUTE_CODE_TOOL_DESCRIPTION = `
 ${EXECUTE_CODE_INTRO}
 
 The 'env' object contains this chat's named bindings:
-* An entry for each Gadget in the workspace, under the name given in the system prompt's gadget list (or the name you passed to \`createGadget\`): an RPC stub pointing at the Gadget's server-side Durable Object. If the user asks you to interact with a Gadget directly, or asks if you can "see" it, use this stub (read the Gadget's server code to learn what RPC methods it exposes).
+* An entry for each Gadget in the workspace, under the name given in the system prompt's gadget list (or the name you passed to \`createGadget\`). Its \`rpc\` property is an RPC stub pointing at the Gadget's server-side Durable Object: if the user asks you to interact with a Gadget directly, or asks if you can "see" it, use this stub (read the Gadget's server code to learn what RPC methods it exposes). Its \`exports\` property exports the Gadget as a file in any format it offers, the same files a user gets from the Workshop's Export menu; use \`describeBinding\` to learn its API if you need it.
 * An entry for each external resource available to this chat: those listed in the system prompt, those the user grants in messages (shown as \`[Resource Title](env.SOME_NAME)\`), and those you obtain with \`requestConnection\`.
 
 Note that this differs from the \`env\` a Gadget's own code sees: a Gadget's server.js sees only that Gadget's own bindings (listed in the system prompt's gadget list), which are wired up separately with \`setGadgetBinding\`. Your bindings and a Gadget's bindings may point at the same resource under the same or different names.
@@ -1260,7 +1272,7 @@ let SPAWNED_EXECUTE_CODE_TOOL_DESCRIPTION = `
 ${EXECUTE_CODE_INTRO}
 
 The 'env' object contains this chat's named bindings:
-* Each binding listed in the system prompt. A Gadget's binding is an RPC stub pointing at the Gadget's server-side Durable Object; read the Gadget's server code to learn what RPC methods it exposes.
+* Each binding listed in the system prompt. A Gadget's binding has an \`rpc\` property, an RPC stub pointing at the Gadget's server-side Durable Object (read the Gadget's server code to learn what RPC methods it exposes), and an \`exports\` property that exports the Gadget as a file (use \`describeBinding\` to learn its API).
 * Each resource a user grants in a message, shown as \`[Resource Title](env.SOME_NAME)\`.
 * Each worktree you create with \`createWorktree\`, under the name you chose.
 
@@ -2970,8 +2982,8 @@ async function runAgentPass(
       let lines = namedSeeds.map(seed =>
           `* env.${seed.name} — ` +
           (seed.isGadget
-              ? `RPC stub to the server-side Durable Object of the Gadget ` +
-                `${JSON.stringify(seed.title)}.`
+              ? `the Gadget ${JSON.stringify(seed.title)}: \`.rpc\` is an RPC stub to its ` +
+                `server-side Durable Object, \`.exports\` exports it as a file.`
               : seed.title));
       systemPromptBindings =
           `You have access to the following bindings via the \`env\` object:\n${lines.join("\n")}`;
