@@ -178,6 +178,28 @@ describe("CheckboxList", () => {
     expect(values().tools).toBe("tool-3");
   });
 
+  it("names an option by its title, describes it by the rest, and toggles it from anywhere on its row", async () => {
+    const { values } = await mount(checkboxSpec(async () => [
+      { value: "search", title: "Search issues", subtitle: "Find issues by text.", meta: "read-only" },
+      { value: "create", title: "Create issue", meta: "needs approval" },
+    ]));
+    await expect.element(page.getByRole("checkbox", { name: "Search issues", exact: true }))
+      .toHaveAccessibleDescription("Find issues by text. read-only");
+    await userEvent.click(page.getByText("Find issues by text."));
+    expect(values().tools).toBe("search");
+    await userEvent.click(page.getByText("needs approval"));
+    expect(values().tools).toBe("search,create");
+  });
+
+  // Partly selected, so an enabled list would offer both Select all and Clear.
+  it("offers no way to change the selection while disabled", async () => {
+    await mount({ ...checkboxSpec(async () => tools, true), initial: { tools: "tool-1" } });
+    await expect.element(page.getByText("1 of 12 selected")).toBeVisible();
+    await expect.element(page.getByRole("checkbox", { name: "Tool 1", exact: true })).toBeDisabled();
+    expect(page.getByRole("button", { name: "Select all" }).elements()).toEqual([]);
+    expect(page.getByRole("button", { name: "Clear" }).elements()).toEqual([]);
+  });
+
   it("blocks readiness and collection while its options failed to load, unless it is disabled", async () => {
     const options = deferred<ConfiguratorUIOption[]>();
     const { readiness, session } = await mount(checkboxSpec(() => options.promise));
