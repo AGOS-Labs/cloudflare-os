@@ -366,6 +366,17 @@ export type SupportedResource = {
    * on this flag rather than probing, since RPC stubs cannot report optional-method presence.
    */
   creationConfigurator?: boolean;
+
+  /**
+   * The urlPattern of the type whose connect card this type appears on, instead of a card of its
+   * own. A card's types share one configurator, which may return a URL of any of them, so
+   * startResourceConfigurator must return that configurator for each of them.
+   *
+   * Each type is still granted separately: holding a grant for one does not cover the others. The
+   * configurator offers only the types the account has granted, and the Workshop asks for the rest
+   * in a single consent request, so group only types that need the same authorization.
+   */
+  groupedWith?: string;
 }
 
 /** Removes every trailing slash from a string in linear time. */
@@ -490,6 +501,13 @@ export interface ResourceConfiguratorHost extends RpcTarget {
    * pre-filled and editable.
    */
   getInitialResource(): Promise<{ resourceUrl: string; resourceUrlPattern: string } | null>;
+
+  /**
+   * The resource types (urlPatterns) the Workshop asks this configurator to choose among, so one
+   * that can return several (see SupportedResource.groupedWith) offers only these. For a creation
+   * configurator, this is the type being created.
+   */
+  getAcceptedResourceUrlPatterns(): Promise<string[]>;
 
   /**
    * Update the parent's iframe sizing to match content in selection/configuration UI.
