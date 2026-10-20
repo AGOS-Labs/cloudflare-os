@@ -82,9 +82,7 @@ import {
   GoogleDocConfiguratorUI,
   GoogleSheetsConfiguratorUI,
   GoogleSlidesConfiguratorUI,
-  DriveAccountConfiguratorUI,
-  DriveFileConfiguratorUI,
-  DriveFolderConfiguratorUI,
+  DriveConfiguratorUI,
 } from "./google-configurators";
 import BIGQUERY_CONFIGURATOR_HTML from "./generated/bigquery-configurator-ui.txt";
 import CALENDAR_CONFIGURATOR_HTML from "./generated/calendar-configurator-ui.txt";
@@ -95,9 +93,7 @@ import GMAIL_CONFIGURATOR_HTML from "./generated/gmail-configurator-ui.txt";
 import GOOGLE_DOC_CONFIGURATOR_HTML from "./generated/google-doc-configurator-ui.txt";
 import GOOGLE_SHEETS_CONFIGURATOR_HTML from "./generated/google-sheets-configurator-ui.txt";
 import GOOGLE_SLIDES_CONFIGURATOR_HTML from "./generated/google-slides-configurator-ui.txt";
-import DRIVE_ACCOUNT_CONFIGURATOR_HTML from "./generated/drive-account-configurator-ui.txt";
-import DRIVE_FILE_CONFIGURATOR_HTML from "./generated/drive-file-configurator-ui.txt";
-import DRIVE_FOLDER_CONFIGURATOR_HTML from "./generated/drive-folder-configurator-ui.txt";
+import DRIVE_CONFIGURATOR_HTML from "./generated/drive-configurator-ui.txt";
 import GOOGLE_LOGO_SVG from "./google-logo.svg";
 import { obsContext } from "./observability.js";
 import { AccessTokenCache, AccessTokenRequest, ACCESS_TOKEN_EXPIRY_SAFETY_MS } from "./auth-retry";
@@ -105,10 +101,11 @@ import { Mutex } from "./mutex";
 import {
   BIGQUERY_HOST, BIGQUERY_RESOURCE, GMAIL_RESOURCE, GOOGLE_CALENDAR_RESOURCE,
   GOOGLE_CHAT_RESOURCE, GOOGLE_CHAT_SPACE_RESOURCE, GOOGLE_CHAT_THREAD_RESOURCE,
-  GOOGLE_DOC_RESOURCE, GOOGLE_DRIVE_FILE_RESOURCE, GOOGLE_DRIVE_FOLDER_RESOURCE,
-  GOOGLE_DRIVE_RESOURCE, GOOGLE_SHEETS_RESOURCE, GOOGLE_SLIDES_RESOURCE, RESOURCE_BY_KIND,
+  GOOGLE_DOC_RESOURCE, GOOGLE_DRIVE_RESOURCE, GOOGLE_SHEETS_RESOURCE, GOOGLE_SLIDES_RESOURCE,
+  RESOURCE_BY_KIND,
   SUPPORTED_RESOURCES, creatableKind, nativeFileUrl,
   grantedResourceUrlPatterns, hasDriveResourceGrant, isPrivateGrant, OFFICE_IMPORT_GRANT,
+  SHARED_DRIVES_GRANT,
   parseResourceUrl, recordedResourceUrlPatterns, type RecordedResourceGrant,
 } from "./resources";
 import {
@@ -900,10 +897,12 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     let id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     let account = this.ctx.exports.UserAccount.get(id);
     let getToken = async (opts?: AccessTokenRequest) => await account.getAccessToken(opts);
-    // The grant is read on every call, since it arrives through a pop-up while the dialog is open.
+    // A private grant is read on every call, since it arrives through a pop-up while the dialog is
+    // open.
+    let holds = (grant: string) => async () =>
+      (await account.getGrantedResourceUrlPatterns()).includes(grant);
     let officeConversion = (kind: OfficeKind) => new OfficeConversion(
-      kind, async opts => (await getToken(opts)).token,
-      async () => (await account.getGrantedResourceUrlPatterns()).includes(OFFICE_IMPORT_GRANT));
+      kind, async opts => (await getToken(opts)).token, holds(OFFICE_IMPORT_GRANT));
 
     if (resourceUrlPattern === BIGQUERY_RESOURCE.urlPattern) {
       return {
@@ -968,24 +967,14 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       };
     }
 
-    if (resourceUrlPattern === GOOGLE_DRIVE_RESOURCE.urlPattern) {
+    // One picker for the whole account and every type grouped with it: a folder or a file.
+    let groupedWith = SUPPORTED_RESOURCES
+      .find(resource => resource.urlPattern === resourceUrlPattern)?.groupedWith;
+    if (resourceUrlPattern === GOOGLE_DRIVE_RESOURCE.urlPattern ||
+        groupedWith === GOOGLE_DRIVE_RESOURCE.urlPattern) {
       return {
-        iframeHtml: DRIVE_ACCOUNT_CONFIGURATOR_HTML,
-        ui: new RpcStub(new DriveAccountConfiguratorUI()),
-      };
-    }
-
-    if (resourceUrlPattern === GOOGLE_DRIVE_FOLDER_RESOURCE.urlPattern) {
-      return {
-        iframeHtml: DRIVE_FOLDER_CONFIGURATOR_HTML,
-        ui: new RpcStub(new DriveFolderConfiguratorUI(getToken)),
-      };
-    }
-
-    if (resourceUrlPattern === GOOGLE_DRIVE_FILE_RESOURCE.urlPattern) {
-      return {
-        iframeHtml: DRIVE_FILE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new DriveFileConfiguratorUI(getToken)),
+        iframeHtml: DRIVE_CONFIGURATOR_HTML,
+        ui: new RpcStub(new DriveConfiguratorUI(getToken, holds(SHARED_DRIVES_GRANT))),
       };
     }
 
