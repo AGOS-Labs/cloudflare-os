@@ -2586,20 +2586,29 @@ export type AgentSpawnerConfig = {
 
   /**
    * The bindings available to agents spawned by this spawner: binding name (as it appears as
-   * `env.NAME` in the spawned agent's executeCode environment) -> target workpiece. When an agent
-   * is spawned, this map is snapshotted into the spawned chat's seed binding layer (entries whose
-   * targets no longer exist are dropped); the spawned agent sees only these bindings, never the
-   * workspace's default binding list.
+   * `env.NAME` in the spawned agent's executeCode environment) -> target workpiece. This is the
+   * spawner's initial set: afterwards the chat agent may add more with `setGadgetBinding`, each
+   * a proposal that takes effect once the user accepts the chat's changes. When an agent is
+   * spawned, the spawner's bindings are snapshotted into the spawned chat's seed binding layer
+   * (entries whose targets no longer exist are dropped); the spawned agent sees only these
+   * bindings, never the workspace's default binding list.
    *
    * The entries are deliberately not limited to bindings held by the gadget that owns the
    * spawner: a spawner may define bindings of its own, with its own names and targets.
    *
-   * Once a gadget binds the spawner, every env target joins each "use" collaborator's
+   * Once a gadget binds the spawner, every binding target joins each "use" collaborator's
    * verification scope transitively: spawning is reachable from the gadget UI, and the spawned
    * agent reads these bindings with the spawner creator's authority.
    */
   env: Record<string, WorkpieceId>,
 };
+
+/**
+ * The `vendorId` with which the agent's requestConnection asks the user to add an agent spawner
+ * (see AgentSpawnerConfig) rather than connect a gatekeeper vendor's resource. No vendor can have
+ * it: vendor ids come from binding names, which have no hyphen.
+ */
+export const AGENT_SPAWNER_CONNECTION_ID = "agent-spawner";
 
 /**
  * Interface to a workspace's Overseer, used to display the Gadget Workshop shell UI around that
@@ -3907,7 +3916,8 @@ export type AiChatMessageBody = {
    * case `change` is omitted). Like `createdGadgets`, the additions are
    * provisional: the edge is visible only from this chat until a merge through this message
    * makes it permanent, and a revert covering it deletes the edge. `name` is the binding's name
-   * within the gadget identified by `gadgetId`; `target` is the bound workpiece.
+   * within the gadget (or agent spawner) identified by `gadgetId`; `target` is the bound
+   * workpiece.
    */
   addedBindings?: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[];
 
@@ -4076,7 +4086,10 @@ export type AiChatMessageBody = {
   /** Unique id used by acceptConnectionRequest()/denyConnectionRequest(). */
   requestId: string;
 
-  /** The gatekeeper vendor the agent is requesting (id + denormalized display name). */
+  /**
+   * The gatekeeper vendor the agent is requesting (id + denormalized display name), or
+   * AGENT_SPAWNER_CONNECTION_ID for an agent spawner.
+   */
   vendorId: string;
   vendorName: string;
 
@@ -4098,9 +4111,10 @@ export type AiChatMessageBody = {
   /**
    * The urlPattern of the supported resource this request resolved to at request time (one of the
    * vendor's SupportedResource.urlPattern values, e.g. "https://github.com/:owner/:repo" or the
-   * whole-instance "https://*"). The backend guarantees every connection request resolves to a
-   * concrete resource (see resolveRequestedResource), and the accept modal pre-selects exactly this
-   * resource — so accepting never opens a blank "create new connection" picker.
+   * whole-instance "https://*"). The backend guarantees every connection request for a vendor
+   * resolves to a concrete resource (see resolveRequestedResource), and the accept modal
+   * pre-selects exactly this resource — so accepting never opens a blank "create new connection"
+   * picker. Absent for an agent spawner, which has no resources: accepting opens its form.
    */
   resourceUrlPattern?: string;
 
@@ -4312,12 +4326,12 @@ export type AiToolCall = {
   };
 } | {
   /**
-   * Wire one of the chat's bindings into a gadget's own binding list. The addition is provisional
-   * to the chat, recorded by a "changes" message (see `addedBindings`).
+   * Wire one of the chat's bindings into a gadget's own binding list, or an agent spawner's. The
+   * addition is provisional to the chat, recorded by a "changes" message (see `addedBindings`).
    */
   toolName: "setGadgetBinding";
   input: {
-    /** Chat binding name of the target gadget. */
+    /** Chat binding name of the target gadget or agent spawner. */
     gadget: string;
     /** Chat binding name of the resource to wire into the gadget. */
     source: string;
@@ -5018,7 +5032,8 @@ export type BlueprintMerge = {
   /**
    * The bindings the release declares that the gadget had none named for, by binding name.
    * Absent if there were none. A binding that exists only to feed an agent spawner
-   * (`spawnerOnly`) is never listed, having no name in the gadget to look for.
+   * (`spawnerOnly`) has no name in the gadget to look for, so it is listed only when a missing
+   * agent-spawner binding's agents get it.
    */
   missingBindings?: Record<string, BlueprintBinding>;
 };
@@ -5196,7 +5211,11 @@ export type GatekeeperCreationSpec = {
   modelName: string;       // model name on the provider's API (e.g. "claude-sonnet-4-6")
 } | {
   type: "agentSpawner";
-  config: AgentSpawnerConfig;
+  /**
+   * The spawner's config, less `env`: its bindings change after creation, so they are binding
+   * edges of the spawner instead, added with the agent's setGadgetBinding tool.
+   */
+  config: Omit<AgentSpawnerConfig, "env">;
 
   /**
    * Denormalized from the creating user's model config at binding creation time.
